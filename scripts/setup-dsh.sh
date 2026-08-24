@@ -191,6 +191,15 @@ banner "dsh local service setup"
 DSH_ENV="$HOME/.dsh/.env"
 DSH_HOME="$HOME/.local/share/im-bridge/dsh"
 DSH_SUPERVISOR="$DSH_HOME/supervisor.mjs"
+# The runtime is a private npm project, never a global install. dsh 0.1.1-rc.2
+# declares only 2 of the client-ui plugins it imports at boot, so pnpm's strict
+# layout fails with ERR_MODULE_NOT_FOUND while npm's flat node_modules resolves
+# them. staging sits beside runtime so the swap is a same-filesystem rename.
+DSH_RUNTIME="$DSH_HOME/runtime"
+DSH_STAGING="$DSH_HOME/staging"
+DSH_FILES_STAGING="$DSH_HOME/staging-files"
+DSH_PREVIOUS_RUNTIME="$DSH_HOME/runtime.previous"
+DSH_RUNTIME_BIN="$DSH_RUNTIME/node_modules/.bin/dsh"
 DSH_AGENTS_HOME="$HOME/.dsh/empty-agents"
 LOG_DIR="$HOME/Library/Logs/im-bridge"
 LOG_FILE="$LOG_DIR/dsh.log"
@@ -198,22 +207,24 @@ PLIST="$HOME/Library/LaunchAgents/dev.im-bridge.dsh.plist"
 LABEL="dev.im-bridge.dsh"
 DOMAIN="gui/$(id -u)"
 BACKUP_DIR=""
-PREVIOUS_DSH_VERSION=""
 SERVICE_WAS_LOADED=0
+SERVICE_STOPPED=0
 FILES_REPLACED=0
-PACKAGE_REPLACED=0
+OLD_RUNTIME_MOVED=0
+NEW_RUNTIME_INSTALLED=0
 TRANSACTION_STARTED=0
 
 rollback() {
   local status=$?
   (( status == 0 || TRANSACTION_STARTED == 0 )) && return 0
-  launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
-  if (( PACKAGE_REPLACED == 1 )); then
-    if [[ -n "$PREVIOUS_DSH_VERSION" ]]; then
-      pnpm add -g "@deepseek-ai/dsh@$PREVIOUS_DSH_VERSION" >/dev/null 2>&1 || true
-    else
-      pnpm remove -g @deepseek-ai/dsh >/dev/null 2>&1 || true
-    fi
+  if (( SERVICE_STOPPED == 1 )); then
+    launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+  fi
+  if (( NEW_RUNTIME_INSTALLED == 1 )); then
+    rm -rf "$DSH_RUNTIME"
+  fi
+  if (( OLD_RUNTIME_MOVED == 1 )); then
+    mv "$DSH_PREVIOUS_RUNTIME" "$DSH_RUNTIME"
   fi
   if (( FILES_REPLACED == 1 )); then
     if [[ -n "$BACKUP_DIR" && -f "$BACKUP_DIR/supervisor.mjs" ]]; then
@@ -227,15 +238,19 @@ rollback() {
       rm -f "$PLIST"
     fi
   fi
-  if (( SERVICE_WAS_LOADED == 1 )) && [[ -f "$PLIST" ]]; then
-    launchctl bootstrap "$DOMAIN" "$PLIST" >/dev/null 2>&1 || true
+  if (( SERVICE_STOPPED == 1 && SERVICE_WAS_LOADED == 1 )) && [[ -f "$PLIST" ]]; then
+    launchctl bootstrap "$DOMAIN" "$PLIST" || warn "failed to restore the previous LaunchAgent; run setup again"
   fi
   # Staged files this run created but never moved into place.
   [[ -z "${SUPERVISOR_RESERVED:-}" ]] || rm -f "$SUPERVISOR_RESERVED"
   [[ -z "${SUPERVISOR_TMP:-}" ]] || rm -f "$SUPERVISOR_TMP"
   [[ -z "${PLIST_TMP:-}" ]] || rm -f "$PLIST_TMP"
+  rm -rf "$DSH_STAGING" "$DSH_FILES_STAGING"
   [[ -z "$BACKUP_DIR" ]] || rm -rf "$BACKUP_DIR"
-  warn "setup failed; previous files, package version, and service were restored when available"
+  # The dsh log survives rollback on purpose: it is the only record of why a
+  # start attempt failed, and the supervisor never writes the key into it.
+  warn "setup failed; previous runtime, files, and service were restored when available"
+  [[ ! -f "$LOG_FILE" ]] || note "dsh log kept for diagnosis: $LOG_FILE"
 }
 trap rollback EXIT
 
@@ -243,14 +258,13 @@ stage "Pre-flight checks"
 say "This verifies local requirements without reading or printing your API key."
 [[ "$(uname -s)" == "Darwin" ]] || { warn "this wizard requires macOS"; exit 1; }
 [[ -t 0 ]] || { warn "run this wizard from an interactive terminal"; exit 1; }
-for command in node npm pnpm launchctl lsof curl plutil; do
+for command in node npm launchctl lsof curl plutil; do
   command -v "$command" >/dev/null 2>&1 || { warn "$command is missing"; exit 1; }
 done
 NODE_BIN=$(command -v node)
 NODE_DIR=$(dirname "$NODE_BIN")
 NODE_MAJOR=$("$NODE_BIN" -p 'Number(process.versions.node.split(".")[0])')
 (( NODE_MAJOR >= 24 )) || { warn "Node.js 24 or newer is required"; exit 1; }
-[[ "$(pnpm --version)" == "11.21.0" ]] || { warn "pnpm 11.21.0 is required by this repository"; exit 1; }
 [[ -f "$DSH_ENV" ]] || { warn "$DSH_ENV does not exist"; exit 1; }
 [[ "$(stat -f '%Lp' "$DSH_ENV")" == "600" ]] || { warn "$DSH_ENV must have mode 600"; exit 1; }
 awk '
@@ -275,7 +289,7 @@ if LISTENER_PID=$(lsof -nP -t -a -iTCP@127.0.0.1:3080 -sTCP:LISTEN 2>/dev/null |
     exit 1
   fi
 fi
-note "Node $("$NODE_BIN" --version), pnpm $(pnpm --version), credential file mode 600."
+note "Node $("$NODE_BIN" --version), npm $(npm --version), credential file mode 600."
 pause "Pre-flight checks passed. Press Enter to continue."
 
 stage "Select dsh version"
@@ -288,17 +302,6 @@ DSH_VERSION=$(npm view @deepseek-ai/dsh version)
 note "Candidate: @deepseek-ai/dsh@$DSH_VERSION"
 [[ "$DSH_VERSION" != *-* ]] || warn "This candidate is a prerelease."
 confirm "Use this exact version for the service?" || exit 1
-PREVIOUS_DSH_VERSION=$(pnpm list -g @deepseek-ai/dsh --depth 0 --json 2>/dev/null | "$NODE_BIN" -e '
-let input="";
-process.stdin.on("data", chunk => input += chunk);
-process.stdin.on("end", () => {
-  try {
-    const report = JSON.parse(input);
-    const root = Array.isArray(report) ? report[0] : report;
-    process.stdout.write(root.dependencies?.["@deepseek-ai/dsh"]?.version ?? "");
-  } catch {}
-});
-')
 note "Selected @deepseek-ai/dsh@$DSH_VERSION."
 pause "Version selected. Press Enter to continue."
 
@@ -306,15 +309,14 @@ stage "Create service files"
 say "A single supervisor strictly parses credentials, owns logging, and propagates dsh failures."
 mkdir -p "$DSH_HOME" "$DSH_AGENTS_HOME" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 chmod 700 "$DSH_HOME" "$DSH_AGENTS_HOME"
-BACKUP_DIR=$(mktemp -d)
+rm -rf "$DSH_FILES_STAGING"
+mkdir -m 700 "$DSH_FILES_STAGING"
 TRANSACTION_STARTED=1
-[[ ! -f "$DSH_SUPERVISOR" ]] || cp "$DSH_SUPERVISOR" "$BACKUP_DIR/supervisor.mjs"
-[[ ! -f "$PLIST" ]] || cp "$PLIST" "$BACKUP_DIR/dsh.plist"
 # Node 24 selects the module loader from the final extension, so the temp file
 # must still end in .mjs or --check fails with ERR_UNKNOWN_FILE_EXTENSION. BSD
 # mktemp only expands XXXXXX at the end of a template, so claim the name
 # exclusively first, then move it back under the .mjs extension.
-SUPERVISOR_RESERVED=$(mktemp "${DSH_SUPERVISOR}.XXXXXX")
+SUPERVISOR_RESERVED=$(mktemp "$DSH_FILES_STAGING/supervisor.XXXXXX")
 SUPERVISOR_TMP="${SUPERVISOR_RESERVED}.mjs"
 mv "$SUPERVISOR_RESERVED" "$SUPERVISOR_TMP"
 cat > "$SUPERVISOR_TMP" <<EOF
@@ -395,7 +397,7 @@ for (let n = 1; n < fileCount; n += 1) {
   }
 }
 
-const child = spawn("$(pnpm bin -g)/dsh", ["web", "--no-open", "--port", "3080"], {
+const child = spawn("$DSH_RUNTIME_BIN", ["web", "--no-open", "--port", "3080"], {
   cwd: "$HOME",
   env: {
     ...process.env,
@@ -427,7 +429,7 @@ EOF
 chmod 700 "$SUPERVISOR_TMP"
 "$NODE_BIN" --check "$SUPERVISOR_TMP"
 
-PLIST_TMP=$(mktemp "${PLIST}.XXXXXX")
+PLIST_TMP="$DSH_FILES_STAGING/dsh.plist"
 cat > "$PLIST_TMP" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -454,36 +456,46 @@ cat > "$PLIST_TMP" <<EOF
 EOF
 chmod 600 "$PLIST_TMP"
 plutil -lint "$PLIST_TMP" >/dev/null
+note "Created credential-safe staged service files with bounded 10 MB x 5 logs."
+pause "Service files validated. Press Enter to install dsh."
+
+stage "Install pinned dsh runtime"
+say "npm installs the exact version into a staging directory; the running service keeps serving until it verifies."
+note "This downloads about 455 packages and takes roughly 12 minutes."
+rm -rf "$DSH_STAGING"
+mkdir -m 700 "$DSH_STAGING"
+printf '{"private":true}\n' > "$DSH_STAGING/package.json"
+# A private project, so npm resolves the plugin tree flat. Global installs are
+# excluded: they put the same tree behind a shared prefix this wizard must not own.
+( cd "$DSH_STAGING" && npm install --no-audit --no-fund --loglevel=error "@deepseek-ai/dsh@$DSH_VERSION" )
+STAGED_BIN="$DSH_STAGING/node_modules/.bin/dsh"
+[[ -x "$STAGED_BIN" ]] || { warn "dsh executable was not installed at $STAGED_BIN"; exit 1; }
+INSTALLED_VERSION=$("$NODE_BIN" -p "require('$DSH_STAGING/node_modules/@deepseek-ai/dsh/package.json').version")
+[[ "$INSTALLED_VERSION" == "$DSH_VERSION" ]] || { warn "installed version mismatch"; exit 1; }
+# Swap runtime and service files only after every staged artifact validates.
+# The old running process remains untouched throughout the long npm install.
+BACKUP_DIR=$(mktemp -d)
+[[ ! -f "$DSH_SUPERVISOR" ]] || cp "$DSH_SUPERVISOR" "$BACKUP_DIR/supervisor.mjs"
+[[ ! -f "$PLIST" ]] || cp "$PLIST" "$BACKUP_DIR/dsh.plist"
+rm -rf "$DSH_PREVIOUS_RUNTIME"
+if [[ -d "$DSH_RUNTIME" ]]; then
+  mv "$DSH_RUNTIME" "$DSH_PREVIOUS_RUNTIME"
+  OLD_RUNTIME_MOVED=1
+fi
+mv "$DSH_STAGING" "$DSH_RUNTIME"
+NEW_RUNTIME_INSTALLED=1
+[[ -x "$DSH_RUNTIME_BIN" ]] || { warn "dsh executable is missing at $DSH_RUNTIME_BIN"; exit 1; }
 FILES_REPLACED=1
 mv "$SUPERVISOR_TMP" "$DSH_SUPERVISOR"
 mv "$PLIST_TMP" "$PLIST"
-note "Created credential-safe service files with bounded 10 MB x 5 logs."
-pause "Service files validated. Press Enter to install dsh."
-
-stage "Install pinned dsh"
-say "The selected exact version is installed globally; failures restore the previous version."
-pnpm add -g "@deepseek-ai/dsh@$DSH_VERSION"
-PACKAGE_REPLACED=1
-DSH_BIN=$(pnpm bin -g)/dsh
-[[ -x "$DSH_BIN" ]] || { warn "dsh executable was not installed at $DSH_BIN"; exit 1; }
-INSTALLED_VERSION=$(pnpm list -g @deepseek-ai/dsh --depth 0 --json | "$NODE_BIN" -e '
-let input="";
-process.stdin.on("data", chunk => input += chunk);
-process.stdin.on("end", () => {
-  const report = JSON.parse(input);
-  const root = Array.isArray(report) ? report[0] : report;
-  const dependency = root.dependencies?.["@deepseek-ai/dsh"];
-  if (!dependency?.version) process.exit(1);
-  process.stdout.write(dependency.version);
-});
-')
-[[ "$INSTALLED_VERSION" == "$DSH_VERSION" ]] || { warn "installed version mismatch"; exit 1; }
-note "Installed @deepseek-ai/dsh@$INSTALLED_VERSION."
+rmdir "$DSH_FILES_STAGING"
+note "Installed @deepseek-ai/dsh@$INSTALLED_VERSION into $DSH_RUNTIME."
 pause "Installation verified. Press Enter to load the service."
 
 stage "Start and verify dsh"
 say "This replaces the loaded copy and verifies the supervisor child and HTTP response."
 launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+SERVICE_STOPPED=1
 launchctl bootstrap "$DOMAIN" "$PLIST"
 launchctl kickstart -k "$DOMAIN/$LABEL"
 for _ in {1..30}; do
@@ -493,17 +505,38 @@ for _ in {1..30}; do
   [[ -n "$SERVICE_PID" && "$SERVICE_PID" == "$PARENT_PID" ]] && break
   sleep 1
 done
+# The key never reaches the log, but a tail is still shown through a redactor
+# and only for lines that match known-safe diagnostic shapes. Anything else is
+# left in the file rather than printed.
+show_log_tail() {
+  [[ -f "$LOG_FILE" ]] || { warn "no dsh log exists at $LOG_FILE"; return 0; }
+  if grep -q 'ERR_MODULE_NOT_FOUND' "$LOG_FILE"; then
+    note "diagnosis: dsh reported a missing module"
+  elif grep -q 'EADDRINUSE' "$LOG_FILE"; then
+    note "diagnosis: dsh reported port 3080 in use"
+  elif grep -q '^dsh web: http://127\.0\.0\.1:3080$' "$LOG_FILE"; then
+    note "diagnosis: dsh reported that the web service started"
+  else
+    note "diagnosis: no recognized startup signature"
+  fi
+  note "full dsh log kept at $LOG_FILE"
+}
 [[ -n "${SERVICE_PID:-}" && "$SERVICE_PID" == "${PARENT_PID:-}" ]] || {
-  warn "the LaunchAgent child did not become the port 3080 listener; inspect $LOG_FILE"
+  warn "the LaunchAgent child did not become the port 3080 listener"
+  show_log_tail
   exit 1
 }
 curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:3080/" >/dev/null || {
-  warn "dsh did not answer the root HTTP check; inspect $LOG_FILE"
+  warn "dsh did not answer the root HTTP check"
+  show_log_tail
   exit 1
 }
 FILES_REPLACED=0
-PACKAGE_REPLACED=0
+OLD_RUNTIME_MOVED=0
+NEW_RUNTIME_INSTALLED=0
+SERVICE_STOPPED=0
 TRANSACTION_STARTED=0
+rm -rf "$DSH_PREVIOUS_RUNTIME"
 trap - EXIT
 note "dsh child PID $LISTENER_PID is listening and responding on 127.0.0.1:3080."
 note "LaunchAgent $LABEL is loaded and will start at the next user login."

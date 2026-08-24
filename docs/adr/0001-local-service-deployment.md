@@ -32,14 +32,32 @@ by hand. That is not reproducible and does not survive a reboot.
 
 ### Backend installation
 
-Install dsh as a pnpm global package pinned to an exact version. Query the
-available versions first and pin the result; do not install a floating range.
-Upgrades are manual: run the upgrade, verify, then restart the service. No
-automatic or scheduled upgrade.
+Install dsh with npm into a private runtime directory,
+`~/.local/share/im-bridge/dsh/runtime`, pinned to an exact version. Query the
+available version first and pin the result; do not install a floating range.
+Upgrades are manual: run the setup script again, verify, then keep or roll back.
+No automatic or scheduled upgrade.
+
+The installer writes to a `staging` sibling of `runtime` and renames it into
+place only after the tree is complete and its version verified. The previous
+runtime is kept as `runtime.previous` until the service answers on its port, so
+a failed upgrade restores the working version.
 
 Rationale: dsh is an independent long-lived service with its own release cadence.
-A pinned version makes a restart reproducible and makes rollback a one-line
-change. `npx` is excluded because it hangs without output.
+A pinned version makes a restart reproducible.
+
+The package manager is not interchangeable here. dsh 0.1.1-rc.2 declares only two
+of the `@deepseek-ai/dsh-client-ui-*` plugins that its boot configuration imports
+dynamically. pnpm's strict layout exposes that gap: the process exits within
+three seconds with `ERR_MODULE_NOT_FOUND`. npm's flat `node_modules` hoists the
+undeclared plugins where the loader finds them, and dsh then listens on
+`127.0.0.1:3080`. Measured 2026-08-24 against the same version. This is a
+workaround for an upstream packaging defect; revisit it when dsh declares its
+plugin dependencies completely.
+
+A private directory is used rather than a global install because the wizard must
+not own a shared npm prefix, and because a directory rename gives an atomic swap
+and a cheap rollback. `npx` is excluded because it hangs without output.
 
 ### Process supervision
 
@@ -99,6 +117,10 @@ path follows when its event loop is implemented.
   restarts the affected service only.
 - Upgrading dsh is a deliberate act with a recorded version, so a regression can
   be traced to a specific change and reverted.
+- The runtime directory holds about 455 packages, so a fresh install takes
+  roughly 12 minutes and the disk cost is paid twice during the swap.
+- A failed start keeps the dsh log. The setup script prints a filtered, redacted
+  tail of it; the full file stays on disk for inspection.
 - Rotating the bot token requires a bridge restart, which drops in-flight
   streaming output. This is accepted: rotation is rare and a restart is fast.
 - The dsh setup script requires an interactive terminal because it asks for

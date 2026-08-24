@@ -145,6 +145,17 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
   要关掉：`DSH_AGENTS_HOME=<空目录> dsh web`。
 - **`dsh` 安装很慢**：455 个包、约 280MB、npm 12 分钟 / pnpm 5 分钟。
   `npx @deepseek-ai/dsh` 会静默卡住不输出任何日志。部署要预装，不能靠冷启动。
+- **dsh 必须用 npm 装，不能用 pnpm**（2026-08-24 实测 `0.1.1-rc.2`）。
+  它的 manifest 只声明 2 个 `@deepseek-ai/dsh-client-ui-*`，启动配置却动态
+  import 了更多。pnpm 的严格布局让缺失暴露：进程 3 秒内报
+  `ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-client-ui-jobs'`
+  并以退出码 1 结束，端口 3080 从未监听。同一版本用 npm 装到独立项目目录，
+  扁平 `node_modules` 把未声明的插件提到可解析位置，3 秒内监听 `127.0.0.1:3080`
+  且 HTTP 200。这是绕过上游打包缺陷，dsh 补全依赖声明后要重新评估。
+- **dsh 装在用户级 runtime 目录，不装全局**：
+  `~/.local/share/im-bridge/dsh/runtime`。先装进同目录下的 `staging`，
+  验证版本后 `mv` 换入，旧版本留成 `runtime.previous` 直到新服务应答端口。
+  目录改名是原子的，回滚只要换回来。
 
 ## Agent skills
 
@@ -201,16 +212,22 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：`scripts/setup-dsh.sh` 改用 npm 装 dsh 到用户级 runtime 目录。
+  原来的 pnpm 全局安装让 dsh 启动 3 秒即退（`ERR_MODULE_NOT_FOUND`，上游
+  manifest 漏声明 client-ui 插件），向导停在第 5 阶段。现在装进
+  `$DSH_HOME/staging` 验证后再换入 `$DSH_HOME/runtime`，旧 runtime 保留到
+  服务应答端口为止；失败时恢复旧 runtime 并保留 `dsh.log`，第 5 阶段打印
+  经过过滤和脱敏的日志尾部。ADR 0001 的「pnpm 全局」决策同步改写。
 - 2026-08-24：修复 `scripts/setup-dsh.sh` 的 supervisor 临时文件名。原写法
   `mktemp "${DSH_SUPERVISOR}.XXXXXX"` 把随机后缀放在 `.mjs` 之后，`node --check`
   报 `ERR_UNKNOWN_FILE_EXTENSION`，向导在第 3 阶段中断。改为先占位创建再
   `mv` 回 `.mjs` 结尾的路径；rollback 现在清理未落位的临时文件。
   新增 `packages/bridge/test/setup-dsh.test.ts` 锁定该行为。
-- 2026-08-24：新增 `scripts/setup-dsh.sh`，交互式锁定并全局安装 dsh，复用
+- 2026-08-24：新增 `scripts/setup-dsh.sh`，交互式锁定并安装 dsh，复用
   `~/.dsh/.env` 的 600 权限凭据，安装 user LaunchAgent，并按 10MB × 5
   定期轮转日志。
 - 2026-08-24：公开发布前的准备。`docs/adr/0001-local-service-deployment.md` 记录
-  dsh 与 bridge 的常驻部署决策：pnpm 全局锁定版本、两个 user LaunchAgent、
+  dsh 与 bridge 的常驻部署决策：锁定精确版本、两个 user LaunchAgent、
   凭据放 600 权限的 `~/.config/im-bridge/env`、日志 10MB × 5。
   `index.ts` 不再打印 token 前缀，只报告 token configured。
 - 2026-08-24：配置 engineering skills：GitHub Issues、默认 triage 标签、单一上下文领域文档布局。
