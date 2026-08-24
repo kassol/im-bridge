@@ -2,7 +2,12 @@
 
 Date: 2026-08-24
 
-Status: accepted
+Status: accepted, partially implemented
+
+Implementation status: `scripts/setup-dsh.sh` implements the dsh installation,
+credential validation, LaunchAgent, and bounded logging decisions. The bridge
+env installer and bridge LaunchAgent remain pending until the bridge event loop
+exists.
 
 ## Context
 
@@ -57,10 +62,10 @@ both cases.
 
 ### Credentials
 
-The Telegram bot token and the numeric user allowlist live in an env-format file
-at `~/.config/im-bridge/env` with mode 600. The install script reads both
+The Telegram bot token and the numeric user allowlist will live in an env-format file
+at `~/.config/im-bridge/env` with mode 600. The bridge setup script will read both
 interactively with terminal echo disabled, so neither value reaches a command
-line, a shell history file, or a transcript. The bridge validates the file at
+line, a shell history file, or a transcript. The bridge will validate the file at
 startup: it checks permissions, required keys, and value format, and exits with
 a clear error when a check fails. Token rotation means editing the file and
 restarting the bridge; there is no hot reload.
@@ -83,9 +88,10 @@ bounded disk cost that needs no attention.
 
 ### Repository artifacts
 
-The repository holds credential-free templates and the install script.
-LaunchAgent property lists and the env file are generated into the user's home
-directory at install time and are never committed.
+The repository holds credential-free templates and setup scripts. LaunchAgent
+property lists and env files are generated into the user's home directory at
+setup time and are never committed. The dsh path is implemented now; the bridge
+path follows when its event loop is implemented.
 
 ## Consequences
 
@@ -95,8 +101,10 @@ directory at install time and are never committed.
   be traced to a specific change and reverted.
 - Rotating the bot token requires a bridge restart, which drops in-flight
   streaming output. This is accepted: rotation is rare and a restart is fast.
-- The install script must run on an interactive terminal, because it prompts for
-  the token with echo disabled. Unattended installation is not supported.
+- The dsh setup script requires an interactive terminal because it asks for
+  confirmation before installing or replacing service files. The future bridge
+  setup script will also prompt for the token with echo disabled. Unattended
+  installation is not supported.
 - Logs older than the retention window are lost. Anything worth keeping longer
   must be copied out.
 - Because the templates carry no secrets, a fresh clone cannot start the

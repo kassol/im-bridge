@@ -58,6 +58,7 @@ packages/bridge/src/
 docs/              实测结论与协议记录
   adr/             架构决策记录
   agents/          engineering skills 配置
+scripts/           可重复的本机安装与运维向导
 ```
 
 ## 核心抽象
@@ -111,6 +112,13 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
   esbuild 必须设 `true`，否则 vitest 起不来。
   注意 `pnpm approve-builds` 可能往 `pnpm-workspace.yaml` 写入占位字符串
   （`esbuild: set this to true or false`），那会让**所有** pnpm 命令直接失败。
+- **`node --check` 按最终扩展名选模块加载器**。临时文件叫 `supervisor.mjs.AbCdEf` 会报
+  `ERR_UNKNOWN_FILE_EXTENSION` 并以退出码 1 结束（Node 24.14.0 实测）。
+  要检查的临时文件必须以 `.mjs` 结尾。
+- **BSD `mktemp` 只展开模板末尾的 `XXXXXX`**。`mktemp "foo.XXXXXX.mjs"` 不做替换，
+  直接报 `mkstemp failed ... File exists`。要保留扩展名就先用末尾模板占位创建，
+  再 `mv` 回带扩展名的路径。
+- **`plutil -lint` 按内容校验，与扩展名无关**。plist 临时文件名不受此限制。
 
 ### dsh
 
@@ -184,12 +192,23 @@ pnpm -F bridge dev        # 起 bridge
 pnpm -F bridge test       # 单测
 pnpm -F bridge typecheck  # 类型检查
 
+# dsh 后端（交互式安装、配置 LaunchAgent 并验证）
+./scripts/setup-dsh.sh
+
 # dsh 后端（另开一个终端，注意关掉 skill 注入）
 DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 ```
 
 ## 变更日志
 
+- 2026-08-24：修复 `scripts/setup-dsh.sh` 的 supervisor 临时文件名。原写法
+  `mktemp "${DSH_SUPERVISOR}.XXXXXX"` 把随机后缀放在 `.mjs` 之后，`node --check`
+  报 `ERR_UNKNOWN_FILE_EXTENSION`，向导在第 3 阶段中断。改为先占位创建再
+  `mv` 回 `.mjs` 结尾的路径；rollback 现在清理未落位的临时文件。
+  新增 `packages/bridge/test/setup-dsh.test.ts` 锁定该行为。
+- 2026-08-24：新增 `scripts/setup-dsh.sh`，交互式锁定并全局安装 dsh，复用
+  `~/.dsh/.env` 的 600 权限凭据，安装 user LaunchAgent，并按 10MB × 5
+  定期轮转日志。
 - 2026-08-24：公开发布前的准备。`docs/adr/0001-local-service-deployment.md` 记录
   dsh 与 bridge 的常驻部署决策：pnpm 全局锁定版本、两个 user LaunchAgent、
   凭据放 600 权限的 `~/.config/im-bridge/env`、日志 10MB × 5。
