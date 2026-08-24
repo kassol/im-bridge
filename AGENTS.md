@@ -63,13 +63,15 @@ scripts/           可重复的本机安装与运维向导
 
 ## 核心抽象
 
-backend adapter 必须实现四个动作，多一个都不加：
+backend adapter 必须实现六个动作，多一个都不加：
 
 ```
 listSessions()                    列出会话
+createSession(cwd)                在允许的工作目录创建会话
 sendPrompt(sessionId, text)       向指定会话发消息
 subscribe(handler)                订阅事件流，handler 收到的事件带 sessionId
 respondApproval(requestId, ok)    回应审批请求
+close()                           关闭连接与后台重连
 ```
 
 platform 层只认这个接口，**不许 import 任何 backend 专有类型**。
@@ -228,6 +230,12 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：完成 dsh adapter 设计，见 `docs/adr/0002-dsh-adapter.md`。Backend
+  契约增加 `close()`，正式成为六动作；确认 HTTP unary + mux/host 双 WebSocket
+  downlink、审批 response 关联、每 subscriber 每 session 64 事件有界队列、cwd root
+  强校验与分层测试策略。
+- 2026-08-24：Backend 契约正式确认为五动作，纳入 `createSession(cwd)`；新增
+  `CONTEXT.md` 固化 backend/session/platform/thread/link/turn/backend event 领域语言。
 - 2026-08-24：修复 dsh supervisor 启动即退且无日志：`basename` / `dirname` 改从
   `node:path` 导入，env 解析正则去掉 heredoc 中多余的反斜杠。Stage 3 新增
   supervisor validation mode，实际完成 ESM 链接与凭据格式校验；新增生成产物执行测试。

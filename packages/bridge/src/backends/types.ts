@@ -34,10 +34,12 @@ export type BackendEvent =
   | { type: "turn-end"; sessionId: string; text: string }
   /** The backend needs a human decision before continuing. */
   | { type: "approval"; sessionId: string; requestId: string; prompt: string }
+  /** The backend degraded but the current turn continues. */
+  | { type: "warning"; sessionId: string; message: string }
   /** The backend failed. Terminal for the current turn. */
   | { type: "error"; sessionId: string; message: string };
 
-export type BackendEventHandler = (event: BackendEvent) => void;
+export type BackendEventHandler = (event: BackendEvent) => void | Promise<void>;
 
 export interface Backend {
   /** Stable name, used in logs and in the link table. */
@@ -60,4 +62,7 @@ export interface Backend {
 
   /** Answer an approval request. Losing a race is normal; see AGENTS.md. */
   respondApproval(requestId: string, approved: boolean): Promise<void>;
+
+  /** Close connections and stop background reconnect work. */
+  close(): Promise<void>;
 }
