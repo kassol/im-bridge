@@ -1,0 +1,103 @@
+# ADR 0001: Local service deployment
+
+Date: 2026-08-24
+
+Status: accepted
+
+## Context
+
+The bridge and its backend are long-running services on a single workstation.
+They are not batch jobs: a Telegram topic must stay answerable while the user
+session is active, so both processes must start at login, restart after a crash,
+and keep bounded logs.
+
+Two facts constrain the design:
+
+- The bridge opens no inbound port. It polls Telegram outbound and connects to
+  dsh on the loopback address only. Deployment therefore needs no firewall or
+  reverse proxy, only process supervision.
+- The bot token is the sole credential in front of an agent that can run shell
+  commands. Every deployment mechanism that touches it (installer, supervisor
+  configuration, log output) is part of the security boundary.
+
+An earlier working session installed dsh into a throwaway directory and ran it
+by hand. That is not reproducible and does not survive a reboot.
+
+## Decision
+
+### Backend installation
+
+Install dsh as a pnpm global package pinned to an exact version. Query the
+available versions first and pin the result; do not install a floating range.
+Upgrades are manual: run the upgrade, verify, then restart the service. No
+automatic or scheduled upgrade.
+
+Rationale: dsh is an independent long-lived service with its own release cadence.
+A pinned version makes a restart reproducible and makes rollback a one-line
+change. `npx` is excluded because it hangs without output.
+
+### Process supervision
+
+Run two separate user LaunchAgents, one for dsh and one for the bridge. Both
+start at user login. Both restart only on abnormal exit, so a deliberate stop
+stays stopped for maintenance.
+
+Rationale: the two services fail and upgrade independently. A single agent would
+couple their restarts and interleave their logs. A system-level daemon would
+require administrator rights for no benefit on a single-user machine.
+
+### Startup ordering
+
+The bridge does not depend on start order. It retries its dsh connection with
+bounded backoff, which also covers dsh restarting underneath a running bridge.
+
+Rationale: a start-order guarantee would only solve the boot race, while the
+reconnect path is needed anyway for mid-session restarts. One mechanism covers
+both cases.
+
+### Credentials
+
+The Telegram bot token and the numeric user allowlist live in an env-format file
+at `~/.config/im-bridge/env` with mode 600. The install script reads both
+interactively with terminal echo disabled, so neither value reaches a command
+line, a shell history file, or a transcript. The bridge validates the file at
+startup: it checks permissions, required keys, and value format, and exits with
+a clear error when a check fails. Token rotation means editing the file and
+restarting the bridge; there is no hot reload.
+
+The DeepSeek API key stays where dsh already expects it, `~/.dsh/.env`. It is not
+merged into the bridge env file.
+
+Rationale: a narrow file keeps each reader limited to the credentials it needs.
+Strict startup validation converts a silent misconfiguration into an immediate,
+named failure. Hot reload would add file-watching state to the one component
+whose failure mode is unauthorised shell access.
+
+### Logging
+
+Each service writes to its own fixed log file, capped at 10 MB per file with 5
+files retained.
+
+Rationale: enough history to diagnose a fault from the previous day, with a
+bounded disk cost that needs no attention.
+
+### Repository artifacts
+
+The repository holds credential-free templates and the install script.
+LaunchAgent property lists and the env file are generated into the user's home
+directory at install time and are never committed.
+
+## Consequences
+
+- The next user login restores both services without manual steps. A crash
+  restarts the affected service only.
+- Upgrading dsh is a deliberate act with a recorded version, so a regression can
+  be traced to a specific change and reverted.
+- Rotating the bot token requires a bridge restart, which drops in-flight
+  streaming output. This is accepted: rotation is rare and a restart is fast.
+- The install script must run on an interactive terminal, because it prompts for
+  the token with echo disabled. Unattended installation is not supported.
+- Logs older than the retention window are lost. Anything worth keeping longer
+  must be copied out.
+- Because the templates carry no secrets, a fresh clone cannot start the
+  services until the install script has produced the env file.

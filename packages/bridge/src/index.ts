@@ -16,7 +16,9 @@ function required(name: string): string {
 }
 
 function main(): void {
-  const botToken = required("TG_BOT_TOKEN");
+  // Presence is all we report. The token guards an agent that can run shell
+  // commands, so no part of it goes to stdout, which ends up in the log file.
+  required("TG_BOT_TOKEN");
   const allowlist = Allowlist.fromEnv(process.env["TG_ALLOWED_USER_IDS"]);
   const dshUrl = process.env["DSH_URL"] ?? "http://127.0.0.1:3080";
   const dbPath = process.env["IM_BRIDGE_DB"] ?? "./im-bridge.db";
@@ -31,7 +33,7 @@ function main(): void {
 
   console.log("im-bridge configured");
   console.log(`  backend      dsh @ ${dshUrl}`);
-  console.log(`  platform     telegram (token ${botToken.slice(0, 6)}…)`);
+  console.log("  platform     telegram (token configured)");
   console.log(`  authorised   ${allowlist.size} user(s)`);
   console.log(`  links        ${dbPath} (${links.list().length} existing)`);
   console.log("Backend and platform loops are not implemented yet.");

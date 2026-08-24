@@ -56,6 +56,8 @@ packages/bridge/src/
   telegram/        Telegram 平台适配：收 update、发消息、渲染
   store/           SQLite link 表
 docs/              实测结论与协议记录
+  adr/             架构决策记录
+  agents/          engineering skills 配置
 ```
 
 ## 核心抽象
@@ -136,6 +138,20 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
 - **`dsh` 安装很慢**：455 个包、约 280MB、npm 12 分钟 / pnpm 5 分钟。
   `npx @deepseek-ai/dsh` 会静默卡住不输出任何日志。部署要预装，不能靠冷启动。
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in GitHub Issues through the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the five canonical labels without overrides. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses a single-context domain documentation layout. See `docs/agents/domain.md`.
+
 ## 全局规范
 
 ### 安全边界
@@ -174,9 +190,13 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：公开发布前的准备。`docs/adr/0001-local-service-deployment.md` 记录
+  dsh 与 bridge 的常驻部署决策：pnpm 全局锁定版本、两个 user LaunchAgent、
+  凭据放 600 权限的 `~/.config/im-bridge/env`、日志 10MB × 5。
+  `index.ts` 不再打印 token 前缀，只报告 token configured。
+- 2026-08-24：配置 engineering skills：GitHub Issues、默认 triage 标签、单一上下文领域文档布局。
 - 2026-08-24：项目初始化。确立 backend/platform 双层抽象与四动作接口，
   固化 Telegram 与 dsh 的实测结论。第一版范围：dsh + Telegram，SQLite 存 link。
   骨架落地：`backends/types.ts`（四动作契约）、`store/links.ts`（SQLite link 表）、
   `telegram/throttle.ts`（1 秒节流 + retry_after 退避）、`telegram/allowlist.ts`（唯一鉴权）。
   17 项单测通过，typecheck 干净。backend 与 platform 的事件循环尚未实现。
-</content>
