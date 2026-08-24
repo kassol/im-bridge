@@ -32,7 +32,7 @@ by hand. That is not reproducible and does not survive a reboot.
 
 ### Backend installation
 
-Install dsh with npm into a private runtime directory,
+Install dsh with pnpm into a private runtime directory,
 `~/.local/share/im-bridge/dsh/runtime`, pinned to an exact version. Query the
 available version first and pin the result; do not install a floating range.
 Upgrades are manual: run the setup script again, verify, then keep or roll back.
@@ -46,18 +46,30 @@ a failed upgrade restores the working version.
 Rationale: dsh is an independent long-lived service with its own release cadence.
 A pinned version makes a restart reproducible.
 
-The package manager is not interchangeable here. dsh 0.1.1-rc.2 declares only two
+The module layout is not interchangeable here. dsh 0.1.1-rc.2 declares only two
 of the `@deepseek-ai/dsh-client-ui-*` plugins that its boot configuration imports
-dynamically. pnpm's strict layout exposes that gap: the process exits within
-three seconds with `ERR_MODULE_NOT_FOUND`. npm's flat `node_modules` hoists the
-undeclared plugins where the loader finds them, and dsh then listens on
-`127.0.0.1:3080`. Measured 2026-08-24 against the same version. This is a
-workaround for an upstream packaging defect; revisit it when dsh declares its
-plugin dependencies completely.
+dynamically. pnpm's default isolated layout exposes that gap: the process exits
+within three seconds with `ERR_MODULE_NOT_FOUND`. The runtime therefore pins
+`node-linker=hoisted` in its own `.npmrc`, which puts the undeclared plugins
+where the loader finds them. The runtime also writes its own
+`pnpm-workspace.yaml` to make the deployment a self-contained single-package
+workspace. This is a workaround for an upstream packaging defect; revisit it
+when dsh declares its plugin dependencies completely.
+
+The install runs with `--ignore-scripts`. The published tarballs already carry
+the prebuilt native artefacts this platform needs, so no install-time lifecycle
+script has to execute inside the deployment.
+
+Measured 2026-08-24, macOS arm64, Node 24.14, pnpm 11.21.0, dsh 0.1.1-rc.2,
+against an isolated empty pnpm store: cold install 3m12s; HTTP 200 on
+`127.0.0.1:3080` five seconds after start; `node-pty`, `koffi` and
+`@deepseek-ai/dsh-subprocess-local` all `require` successfully; `session.create`
+and `session.list` both succeed. A model-driven bash tool call was not exercised
+end to end, so the shell path carries residual risk (see Consequences).
 
 A private directory is used rather than a global install because the wizard must
-not own a shared npm prefix, and because a directory rename gives an atomic swap
-and a cheap rollback. `npx` is excluded because it hangs without output.
+not own a shared package prefix, and because a directory rename gives an atomic
+swap and a cheap rollback. `npx` is excluded because it hangs without output.
 
 ### Process supervision
 
@@ -117,8 +129,14 @@ path follows when its event loop is implemented.
   restarts the affected service only.
 - Upgrading dsh is a deliberate act with a recorded version, so a regression can
   be traced to a specific change and reverted.
-- The runtime directory holds about 455 packages, so a fresh install takes
-  roughly 12 minutes and the disk cost is paid twice during the swap.
+- The runtime directory holds about 450 packages, so a fresh install takes
+  roughly 3 minutes against a cold pnpm store and the disk cost is paid twice
+  during the swap.
+- `--ignore-scripts` is validated only as far as Web startup, native module
+  loading and session create/list. A model-driven bash tool call was never run
+  end to end, so a subprocess path that needs an install-time script would fail
+  at first use rather than at install time. Re-check this when dsh changes its
+  native or spawn-helper packaging.
 - A failed start keeps the dsh log. The setup script prints a filtered, redacted
   tail of it; the full file stays on disk for inspection.
 - Rotating the bot token requires a bridge restart, which drops in-flight

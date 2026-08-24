@@ -191,10 +191,11 @@ banner "dsh local service setup"
 DSH_ENV="$HOME/.dsh/.env"
 DSH_HOME="$HOME/.local/share/im-bridge/dsh"
 DSH_SUPERVISOR="$DSH_HOME/supervisor.mjs"
-# The runtime is a private npm project, never a global install. dsh 0.1.1-rc.2
-# declares only 2 of the client-ui plugins it imports at boot, so pnpm's strict
-# layout fails with ERR_MODULE_NOT_FOUND while npm's flat node_modules resolves
-# them. staging sits beside runtime so the swap is a same-filesystem rename.
+# The runtime is a private pnpm project, never a global install. dsh 0.1.1-rc.2
+# declares only 2 of the client-ui plugins it imports at boot, so the runtime
+# pins node-linker=hoisted; pnpm's default isolated layout fails with
+# ERR_MODULE_NOT_FOUND. staging sits beside runtime so the swap is a
+# same-filesystem rename.
 DSH_RUNTIME="$DSH_HOME/runtime"
 DSH_STAGING="$DSH_HOME/staging"
 DSH_FILES_STAGING="$DSH_HOME/staging-files"
@@ -258,13 +259,15 @@ stage "Pre-flight checks"
 say "This verifies local requirements without reading or printing your API key."
 [[ "$(uname -s)" == "Darwin" ]] || { warn "this wizard requires macOS"; exit 1; }
 [[ -t 0 ]] || { warn "run this wizard from an interactive terminal"; exit 1; }
-for command in node npm launchctl lsof curl plutil; do
+for command in node npm pnpm launchctl lsof curl plutil; do
   command -v "$command" >/dev/null 2>&1 || { warn "$command is missing"; exit 1; }
 done
 NODE_BIN=$(command -v node)
 NODE_DIR=$(dirname "$NODE_BIN")
 NODE_MAJOR=$("$NODE_BIN" -p 'Number(process.versions.node.split(".")[0])')
 (( NODE_MAJOR >= 24 )) || { warn "Node.js 24 or newer is required"; exit 1; }
+# The hoisted-runtime layout is measured against this exact pnpm release.
+[[ "$(pnpm --version)" == "11.21.0" ]] || { warn "pnpm 11.21.0 is required by this repository"; exit 1; }
 [[ -f "$DSH_ENV" ]] || { warn "$DSH_ENV does not exist"; exit 1; }
 [[ "$(stat -f '%Lp' "$DSH_ENV")" == "600" ]] || { warn "$DSH_ENV must have mode 600"; exit 1; }
 awk '
@@ -289,7 +292,7 @@ if LISTENER_PID=$(lsof -nP -t -a -iTCP@127.0.0.1:3080 -sTCP:LISTEN 2>/dev/null |
     exit 1
   fi
 fi
-note "Node $("$NODE_BIN" --version), npm $(npm --version), credential file mode 600."
+note "Node $("$NODE_BIN" --version), pnpm $(pnpm --version), credential file mode 600."
 pause "Pre-flight checks passed. Press Enter to continue."
 
 stage "Select dsh version"
@@ -460,20 +463,27 @@ note "Created credential-safe staged service files with bounded 10 MB x 5 logs."
 pause "Service files validated. Press Enter to install dsh."
 
 stage "Install pinned dsh runtime"
-say "npm installs the exact version into a staging directory; the running service keeps serving until it verifies."
-note "This downloads about 455 packages and takes roughly 12 minutes."
+say "pnpm installs the exact version into a staging directory; the running service keeps serving until it verifies."
+note "This downloads about 450 packages and takes roughly 3 minutes on a cold store."
 rm -rf "$DSH_STAGING"
 mkdir -m 700 "$DSH_STAGING"
 printf '{"private":true}\n' > "$DSH_STAGING/package.json"
-# A private project, so npm resolves the plugin tree flat. Global installs are
-# excluded: they put the same tree behind a shared prefix this wizard must not own.
-( cd "$DSH_STAGING" && npm install --no-audit --no-fund --loglevel=error "@deepseek-ai/dsh@$DSH_VERSION" )
+# node-linker=hoisted is load-bearing: dsh imports client-ui plugins it never
+# declares, and only a hoisted node_modules puts them where its loader looks.
+printf 'node-linker=hoisted\n' > "$DSH_STAGING/.npmrc"
+# Keep the runtime self-contained as a single-package pnpm workspace.
+printf 'packages:\n  - "."\n' > "$DSH_STAGING/pnpm-workspace.yaml"
+# --ignore-scripts keeps install-time lifecycle scripts out of the deployment.
+# Measured 2026-08-24 on macOS arm64: the published tarballs already carry the
+# prebuilt native artefacts this platform needs. Global installs are excluded:
+# they put the same tree behind a shared prefix this wizard must not own.
+( cd "$DSH_STAGING" && pnpm add -w --ignore-scripts "@deepseek-ai/dsh@$DSH_VERSION" )
 STAGED_BIN="$DSH_STAGING/node_modules/.bin/dsh"
 [[ -x "$STAGED_BIN" ]] || { warn "dsh executable was not installed at $STAGED_BIN"; exit 1; }
 INSTALLED_VERSION=$("$NODE_BIN" -p "require('$DSH_STAGING/node_modules/@deepseek-ai/dsh/package.json').version")
 [[ "$INSTALLED_VERSION" == "$DSH_VERSION" ]] || { warn "installed version mismatch"; exit 1; }
 # Swap runtime and service files only after every staged artifact validates.
-# The old running process remains untouched throughout the long npm install.
+# The old running process remains untouched throughout the long pnpm install.
 BACKUP_DIR=$(mktemp -d)
 [[ ! -f "$DSH_SUPERVISOR" ]] || cp "$DSH_SUPERVISOR" "$BACKUP_DIR/supervisor.mjs"
 [[ ! -f "$PLIST" ]] || cp "$PLIST" "$BACKUP_DIR/dsh.plist"

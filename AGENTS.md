@@ -143,15 +143,23 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
   **不是** `~/.pi/agent/skills`，两者内容相同是因为共用磁盘目录。
   每个 session 注入一次，实测让一句话 prompt 的 input 涨到 10546 token。
   要关掉：`DSH_AGENTS_HOME=<空目录> dsh web`。
-- **`dsh` 安装很慢**：455 个包、约 280MB、npm 12 分钟 / pnpm 5 分钟。
+- **`dsh` 安装很慢**：约 450 个包、约 280MB，pnpm 冷 store 实测 3 分 12 秒。
   `npx @deepseek-ai/dsh` 会静默卡住不输出任何日志。部署要预装，不能靠冷启动。
-- **dsh 必须用 npm 装，不能用 pnpm**（2026-08-24 实测 `0.1.1-rc.2`）。
+- **dsh 的 runtime 必须用 hoisted 布局**（2026-08-24 实测 `0.1.1-rc.2`）。
   它的 manifest 只声明 2 个 `@deepseek-ai/dsh-client-ui-*`，启动配置却动态
-  import 了更多。pnpm 的严格布局让缺失暴露：进程 3 秒内报
+  import 了更多。pnpm 默认的隔离布局让缺失暴露：进程 3 秒内报
   `ERR_MODULE_NOT_FOUND: Cannot find package '@deepseek-ai/dsh-client-ui-jobs'`
-  并以退出码 1 结束，端口 3080 从未监听。同一版本用 npm 装到独立项目目录，
-  扁平 `node_modules` 把未声明的插件提到可解析位置，3 秒内监听 `127.0.0.1:3080`
-  且 HTTP 200。这是绕过上游打包缺陷，dsh 补全依赖声明后要重新评估。
+  并以退出码 1 结束，端口 3080 从未监听。在 runtime 目录写 `.npmrc` 的
+  `node-linker=hoisted` 后，未声明的插件被提到可解析位置。runtime 使用独立的
+  `pnpm-workspace.yaml`，明确为单 package workspace。这是绕过上游打包缺陷，
+  dsh 补全依赖声明后要重新评估。
+- **dsh 可以用 `--ignore-scripts` 装**（2026-08-24 实测，macOS arm64、
+  Node 24.14、pnpm 11.21.0、独立空 store）：冷装 3 分 12 秒，启动后 5 秒
+  `127.0.0.1:3080` 返回 HTTP 200，`node-pty` / `koffi` /
+  `@deepseek-ai/dsh-subprocess-local` 均 `require` 成功，`session.create` 与
+  `session.list` 均成功。发布的 tarball 已带本平台预编译产物，所以安装期
+  lifecycle 脚本不必在部署目录里执行。**未验证**：模型驱动的 bash 工具调用没有
+  端到端跑过，需要安装脚本的 subprocess 路径会在首次使用时才暴露。
 - **dsh 装在用户级 runtime 目录，不装全局**：
   `~/.local/share/im-bridge/dsh/runtime`。先装进同目录下的 `staging`，
   验证版本后 `mv` 换入，旧版本留成 `runtime.previous` 直到新服务应答端口。
@@ -212,6 +220,12 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：`scripts/setup-dsh.sh` 的 Stage 4 改用 pnpm hoisted +
+  `--ignore-scripts` 装 dsh，替换原来的 npm 安装。runtime staging 里写
+  `.npmrc`（`node-linker=hoisted`）、`package.json` 与 `pnpm-workspace.yaml`，
+  staging/runtime/service-files 的原子切换与精确 rollback 保持不变；预检恢复
+  pnpm 11.21.0 校验。实测范围与 bash 未端到端验证的风险记在「实测结论」与
+  ADR 0001。
 - 2026-08-24：`scripts/setup-dsh.sh` 改用 npm 装 dsh 到用户级 runtime 目录。
   原来的 pnpm 全局安装让 dsh 启动 3 秒即退（`ERR_MODULE_NOT_FOUND`，上游
   manifest 漏声明 client-ui 插件），向导停在第 5 阶段。现在装进

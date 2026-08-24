@@ -81,17 +81,33 @@ describe("setup-dsh.sh supervisor temp file", () => {
 });
 
 // dsh 0.1.1-rc.2 declares only 2 of the client-ui plugins its boot config
-// imports. pnpm's strict layout hides the undeclared ones and dsh exits with
-// ERR_MODULE_NOT_FOUND within 3 seconds; npm's flat node_modules resolves them
-// and dsh listens on 127.0.0.1:3080. The wizard must therefore install with npm
-// into a private runtime directory, never as a global package.
+// imports. pnpm's default isolated layout hides the undeclared ones and dsh
+// exits with ERR_MODULE_NOT_FOUND within 3 seconds; a hoisted node_modules
+// resolves them and dsh listens on 127.0.0.1:3080. Measured 2026-08-24 on
+// macOS arm64 with a cold pnpm store, install --ignore-scripts: 3m12s to
+// install, HTTP 200 after 5 seconds. The wizard must therefore install with
+// pnpm into a private hoisted runtime directory, never as a global package.
 describe("setup-dsh.sh dsh runtime installation", () => {
   const script = () => readFileSync(scriptPath, "utf8");
 
-  it("installs the pinned version with npm inside the staging directory", () => {
+  it("installs the pinned version with pnpm inside the staging directory", () => {
     expect(script()).toContain(
-      '( cd "$DSH_STAGING" && npm install --no-audit --no-fund --loglevel=error "@deepseek-ai/dsh@$DSH_VERSION" )',
+      '( cd "$DSH_STAGING" && pnpm add -w --ignore-scripts "@deepseek-ai/dsh@$DSH_VERSION" )',
     );
+  });
+
+  it("pins the hoisted node linker the dsh loader depends on", () => {
+    const text = script();
+    expect(text).toContain(`printf 'node-linker=hoisted\\n' > "$DSH_STAGING/.npmrc"`);
+    // pnpm 11 needs the runtime to be its own workspace root, otherwise an
+    // ancestor workspace file would decide the runtime's install layout.
+    expect(text).toContain(`printf 'packages:\\n  - "."\\n' > "$DSH_STAGING/pnpm-workspace.yaml"`);
+  });
+
+  it("verifies the pnpm release the hoisted layout was measured against", () => {
+    const text = script();
+    expect(text).toContain('[[ "$(pnpm --version)" == "11.21.0" ]]');
+    expect(text).toContain("for command in node npm pnpm launchctl lsof curl plutil; do");
   });
 
   it("never installs dsh globally", () => {
@@ -117,7 +133,7 @@ describe("setup-dsh.sh dsh runtime installation", () => {
     expect(text).toContain('DSH_RUNTIME="$DSH_HOME/runtime"');
     expect(text).toContain('DSH_STAGING="$DSH_HOME/staging"');
     // The staged tree must be complete before the live runtime is touched.
-    const installAt = text.indexOf("npm install --no-audit");
+    const installAt = text.indexOf("pnpm add -w --ignore-scripts");
     const versionCheckAt = text.indexOf('[[ "$INSTALLED_VERSION" == "$DSH_VERSION" ]]');
     const swapAt = text.indexOf('mv "$DSH_STAGING" "$DSH_RUNTIME"');
     const filesSwapAt = text.indexOf('mv "$SUPERVISOR_TMP" "$DSH_SUPERVISOR"');
@@ -127,7 +143,7 @@ describe("setup-dsh.sh dsh runtime installation", () => {
     expect(filesSwapAt).toBeGreaterThan(swapAt);
   });
 
-  it("creates an explicit private npm project before installation", () => {
+  it("creates an explicit private project before installation", () => {
     const text = script();
     expect(text).toContain(`printf '{"private":true}\\n' > "$DSH_STAGING/package.json"`);
   });
