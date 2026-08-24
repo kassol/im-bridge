@@ -1,0 +1,9 @@
+packages:
+  - "packages/*"
+
+# vitest runs through esbuild, which installs its platform binary from a
+# postinstall script. Without this, every pnpm command fails on the
+# ignored-builds check. Note pnpm 11 uses `allowBuilds`, and a placeholder
+# value here (as `pnpm approve-builds` may write) breaks installs outright.
+allowBuilds:
+  esbuild: true
