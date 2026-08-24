@@ -120,6 +120,14 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
   再 `mv` 回带扩展名的路径。
 - **`plutil -lint` 按内容校验，与扩展名无关**。plist 临时文件名不受此限制。
 
+- **`node --check` 只查语法，不验证 ESM named export**。`basename` / `dirname`
+  错从 `node:fs` 导入时，`--check` 仍返回 0，实际执行才报
+  `SyntaxError: node:fs does not provide an export named 'basename'`。生成 supervisor 后
+  必须执行 validation mode，让模块完成链接和凭据格式校验，再安装 LaunchAgent。
+- **未引用 heredoc 里的 JavaScript 正则不要双重转义**。shell 不会处理反斜杠；脚本写
+  `/\\s/` 会原样生成匹配反斜杠或 `s` 的正则，含字母 `s` 的 key 因此校验失败。
+  源 heredoc 写 `/\s/`，生成文件才是目标正则。
+
 ### dsh
 
 - **RPC 信封**：`{type:"client-request", rpcId, method, payload}`。
@@ -220,6 +228,9 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：修复 dsh supervisor 启动即退且无日志：`basename` / `dirname` 改从
+  `node:path` 导入，env 解析正则去掉 heredoc 中多余的反斜杠。Stage 3 新增
+  supervisor validation mode，实际完成 ESM 链接与凭据格式校验；新增生成产物执行测试。
 - 2026-08-24：`scripts/setup-dsh.sh` 的 Stage 4 改用 pnpm hoisted +
   `--ignore-scripts` 装 dsh，替换原来的 npm 安装。runtime staging 里写
   `.npmrc`（`node-linker=hoisted`）、`package.json` 与 `pnpm-workspace.yaml`，

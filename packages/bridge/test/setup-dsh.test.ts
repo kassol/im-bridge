@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -21,6 +21,47 @@ function supervisorTempSnippet(): string {
   expect(start, "script must reserve a supervisor temp name").toBeGreaterThan(-1);
   expect(end).toBeGreaterThan(start);
   return lines.slice(start, end).join("\n");
+}
+
+function supervisorHeredocSnippet(): string {
+  const script = readFileSync(scriptPath, "utf8");
+  const startMarker = 'cat > "$SUPERVISOR_TMP" <<EOF\n';
+  const start = script.indexOf(startMarker);
+  const end = script.indexOf("\nEOF", start + startMarker.length);
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  return script.slice(start, end + "\nEOF".length);
+}
+
+function generateSupervisor(options: {
+  envFile: string;
+  logFile: string;
+  runtimeBin?: string;
+  output: string;
+}): void {
+  const runtimeBin = options.runtimeBin ?? join(workspace, "missing-dsh");
+  execFileSync(
+    "bash",
+    [
+      "-c",
+      `set -euo pipefail
+SUPERVISOR_TMP="$1"
+DSH_ENV="$2"
+LOG_FILE="$3"
+DSH_RUNTIME_BIN="$4"
+NODE_DIR="$5"
+DSH_AGENTS_HOME="$6"
+${supervisorHeredocSnippet()}`,
+      "generate-supervisor",
+      options.output,
+      options.envFile,
+      options.logFile,
+      runtimeBin,
+      dirname(process.execPath),
+      join(workspace, "empty-agents"),
+    ],
+    { cwd: workspace, env: { ...process.env, HOME: workspace } },
+  );
 }
 
 let workspace: string;
@@ -71,6 +112,35 @@ describe("setup-dsh.sh supervisor temp file", () => {
     const first = resolveTempPath(snippet);
     const second = resolveTempPath(snippet);
     expect(first).not.toBe(second);
+  });
+
+  it("links and reaches the spawn boundary before service installation", () => {
+    const envFile = join(workspace, "dsh.env");
+    const logFile = join(workspace, "dsh.log");
+    const supervisor = join(workspace, "supervisor.mjs");
+    writeFileSync(envFile, "DEEPSEEK_API_KEY=test-only-key\n", { mode: 0o600 });
+
+    generateSupervisor({ envFile, logFile, output: supervisor });
+
+    expect(() => execFileSync(process.execPath, [supervisor], { stdio: "pipe" })).toThrow();
+    expect(readFileSync(logFile, "utf8")).toContain("dsh spawn failed:");
+  });
+
+  it("links in validation mode without touching the service log", () => {
+    const envFile = join(workspace, "validate.env");
+    const logFile = join(workspace, "validate.log");
+    const supervisor = join(workspace, "validate.mjs");
+    writeFileSync(envFile, "DEEPSEEK_API_KEY=test-only-key\n", { mode: 0o600 });
+
+    generateSupervisor({ envFile, logFile, output: supervisor });
+
+    expect(() =>
+      execFileSync(process.execPath, [supervisor], {
+        env: { ...process.env, DSH_SUPERVISOR_VALIDATE: "1" },
+        stdio: "pipe",
+      }),
+    ).not.toThrow();
+    expect(() => readFileSync(logFile)).toThrow();
   });
 
   it("cleans both reserved and final temp paths during rollback", () => {

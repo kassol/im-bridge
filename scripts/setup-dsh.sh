@@ -324,8 +324,6 @@ SUPERVISOR_TMP="${SUPERVISOR_RESERVED}.mjs"
 mv "$SUPERVISOR_RESERVED" "$SUPERVISOR_TMP"
 cat > "$SUPERVISOR_TMP" <<EOF
 import {
-  basename,
-  dirname,
   closeSync,
   existsSync,
   openSync,
@@ -336,6 +334,7 @@ import {
   statSync,
   writeSync,
 } from "node:fs";
+import { basename, dirname } from "node:path";
 import { spawn } from "node:child_process";
 
 const envFile = "$DSH_ENV";
@@ -345,11 +344,12 @@ const logFile = "$LOG_FILE";
 const maxBytes = 10485760;
 const fileCount = 5;
 const lines = readFileSync(envFile, "utf8")
-  .split(/\\r?\\n/)
-  .filter(line => !/^\\s*(#|$)/.test(line));
+  .split(/\r?\n/)
+  .filter(line => !/^\s*(#|$)/.test(line));
 if (lines.length !== 1) throw new Error("dsh env must contain only DEEPSEEK_API_KEY");
-const match = /^DEEPSEEK_API_KEY=([^\\s]+)$/.exec(lines[0]);
+const match = /^DEEPSEEK_API_KEY=([^\s]+)$/.exec(lines[0]);
 if (!match) throw new Error("invalid or empty DEEPSEEK_API_KEY");
+if (process.env.DSH_SUPERVISOR_VALIDATE === "1") process.exit(0);
 
 let fd;
 let size;
@@ -431,6 +431,7 @@ child.on("exit", code => {
 EOF
 chmod 700 "$SUPERVISOR_TMP"
 "$NODE_BIN" --check "$SUPERVISOR_TMP"
+DSH_SUPERVISOR_VALIDATE=1 "$NODE_BIN" "$SUPERVISOR_TMP"
 
 PLIST_TMP="$DSH_FILES_STAGING/dsh.plist"
 cat > "$PLIST_TMP" <<EOF
