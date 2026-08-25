@@ -23,6 +23,8 @@ export interface FakeReply {
   raw?: string;
   /** Never answer, so the client hits its own timeout. */
   hang?: true;
+  /** Drop the connection with no response, as `api.telegram.org` does. */
+  destroy?: true;
   /** A complete file body, sent with its real Content-Length. */
   bytes?: Uint8Array;
   /** A file body written chunk by chunk, so a client can stop mid-body. */
@@ -113,6 +115,10 @@ export async function startFakeTelegram(
       const reply = await handle(call);
       if (reply.hang === true) {
         open.add(response);
+        return;
+      }
+      if (reply.destroy === true) {
+        response.destroy();
         return;
       }
       if (reply.bytes !== undefined) {

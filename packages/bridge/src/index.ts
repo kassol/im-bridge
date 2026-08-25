@@ -18,7 +18,12 @@
  * Every command prints JSON Lines through the same logger the service uses, so
  * the field whitelist that keeps tokens and user content out of the log keeps
  * them out of the wizard's terminal too.
+ *
+ * The commands are exported and take the Bot API base URL, so the tests drive
+ * them against the fake Bot API instead of a spawned process. The service only
+ * starts when this file is the entry point of the process.
  */
+import { realpathSync } from "node:fs";
 import { DshBackend } from "./backends/dsh.ts";
 import { loadConfig, type BridgeConfig } from "./config.ts";
 import { createLogger, type Logger } from "./log.ts";
@@ -171,10 +176,10 @@ function listDeadLetters(config: BridgeConfig): void {
  * have: the detection message is accounted for instead of being replayed as a
  * prompt by the service that starts later.
  */
-async function detectTopic(config: BridgeConfig): Promise<void> {
+export async function detectTopic(config: BridgeConfig, baseUrl?: string): Promise<void> {
   const logger = createLogger({ level: config.logLevel });
   const allowlist = new Allowlist(config.allowedUserIds);
-  const api = new TelegramApi({ token: config.botToken, logger });
+  const api = new TelegramApi({ token: config.botToken, baseUrl, logger });
   const identity = await api.getMe();
   logger.info("bridge.probe.identity", { botId: identity.id });
   const store = new Store(config.databasePath);
@@ -211,12 +216,16 @@ async function detectTopic(config: BridgeConfig): Promise<void> {
  * fallback, so a bot that cannot stream a draft and land a final Rich Message
  * must not be installed as a service. The evidence is ids and durations only.
  */
-async function probeRichMessages(config: BridgeConfig, args: readonly string[]): Promise<void> {
+export async function probeRichMessages(
+  config: BridgeConfig,
+  args: readonly string[],
+  baseUrl?: string,
+): Promise<void> {
   const threadId = readNumberFlag(args, "--thread");
   if (threadId === undefined) throw new Error(USAGE);
   const chatId = readNumberFlag(args, "--chat") ?? soleAllowedUserId(config);
   const logger = createLogger({ level: config.logLevel });
-  const api = new TelegramApi({ token: config.botToken, logger });
+  const api = new TelegramApi({ token: config.botToken, baseUrl, logger });
 
   const identity = await api.getMe();
   logger.info("bridge.probe.identity", { botId: identity.id });
@@ -261,7 +270,7 @@ async function timed<T>(
  * A private chat's id is the user's id, so a single-user allowlist names the
  * chat. More than one user is ambiguous and has to be said explicitly.
  */
-function soleAllowedUserId(config: BridgeConfig): number {
+export function soleAllowedUserId(config: BridgeConfig): number {
   const [only, ...rest] = config.allowedUserIds;
   if (only === undefined || rest.length > 0) {
     throw new Error("Pass --chat <id>: the allowlist does not name a single private chat");
@@ -269,7 +278,7 @@ function soleAllowedUserId(config: BridgeConfig): number {
   return only;
 }
 
-function readNumberFlag(args: readonly string[], flag: string): number | undefined {
+export function readNumberFlag(args: readonly string[], flag: string): number | undefined {
   const at = args.indexOf(flag);
   if (at < 0) return undefined;
   const value = Number(args[at + 1]);
@@ -277,10 +286,14 @@ function readNumberFlag(args: readonly string[], flag: string): number | undefin
   return value;
 }
 
-try {
-  await main();
-} catch (error) {
-  // Configuration and startup errors carry no credential by construction.
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
+// Only the process that was started with this file runs a bridge. Importing it
+// — as the command tests do — must not poll Telegram or open a database.
+if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === import.meta.filename) {
+  try {
+    await main();
+  } catch (error) {
+    // Configuration and startup errors carry no credential by construction.
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
 }

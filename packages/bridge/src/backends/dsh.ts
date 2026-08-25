@@ -1,12 +1,13 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
-import type {
-  Backend,
-  BackendEvent,
-  BackendEventHandler,
-  PromptContent,
-  PromptContentPart,
-  Session,
+import {
+  ApprovalNotPendingError,
+  type Backend,
+  type BackendEvent,
+  type BackendEventHandler,
+  type PromptContent,
+  type PromptContentPart,
+  type Session,
 } from "./types.ts";
 
 export interface DshLogger {
@@ -127,7 +128,7 @@ export class DshBackend implements Backend {
   async respondApproval(requestId: string, approved: boolean): Promise<void> {
     this.#assertOpen();
     const pending = this.#pendingApprovals.get(requestId);
-    if (pending === undefined) throw new Error(`Unknown approval request: ${requestId}`);
+    if (pending === undefined) throw new ApprovalNotPendingError(`Unknown approval request: ${requestId}`);
     let response: Response;
     try {
       response = await fetch(new URL("/api/respond", this.#baseUrl), {
@@ -292,7 +293,11 @@ export class DshBackend implements Backend {
         return;
       }
       this.#pendingApprovals.set(value.rpcId, { sessionId: payload.sessionId, approvalId: payload.approvalId });
-      const prompt = typeof payload.reason === "string" ? payload.reason : `Allow ${payload.toolName}?`;
+      // The reason explains the call, the tool name says what would run; a
+      // user answering on a phone needs both.
+      const prompt = typeof payload.reason === "string"
+        ? `${payload.toolName}: ${payload.reason}`
+        : `Allow ${payload.toolName}?`;
       this.#emit({ type: "approval", sessionId: payload.sessionId, requestId: value.rpcId, prompt });
       return;
     }

@@ -7,12 +7,13 @@
  * `setRunning` plays a turn that is under way, and `emit` plays an event the
  * way the dsh adapter delivers one — awaited, and serialised per session.
  */
-import type {
-  Backend,
-  BackendEvent,
-  BackendEventHandler,
-  PromptContent,
-  Session,
+import {
+  ApprovalNotPendingError,
+  type Backend,
+  type BackendEvent,
+  type BackendEventHandler,
+  type PromptContent,
+  type Session,
 } from "../src/backends/types.ts";
 
 export class FakeBackend implements Backend {
@@ -77,6 +78,13 @@ export class FakeBackend implements Backend {
   /** Plays one backend event and waits for the subscriber, as dsh does. */
   async emit(event: BackendEvent): Promise<void> {
     for (const handler of [...this.#handlers]) await handler(event);
+  }
+
+  /** Plays the race dsh has: another client answered the request first. */
+  answerElsewhere(): void {
+    this.respondApprovalWith = (requestId) => {
+      throw new ApprovalNotPendingError(`Unknown approval request: ${requestId}`);
+    };
   }
 
   /** A session that disappeared from the backend, without the bridge asking. */

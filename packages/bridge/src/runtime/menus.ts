@@ -12,7 +12,7 @@
  */
 import type { Session } from "../backends/types.ts";
 import type { InlineKeyboard, InlineKeyboardButton } from "../telegram/api.ts";
-import { headChars } from "../telegram/markdown.ts";
+import { charLength, headChars } from "../telegram/markdown.ts";
 import { encodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
 
 /** Sessions shown per page. More rows than this stops fitting on a phone. */
@@ -188,5 +188,5 @@ function closeButton(epoch: string): InlineKeyboardButton {
 }
 
 function truncate(text: string): string {
-  return text.length <= LABEL_LIMIT ? text : `${text.slice(0, LABEL_LIMIT - 1)}…`;
+  return charLength(text) <= LABEL_LIMIT ? text : `${headChars(text, LABEL_LIMIT - 1)}…`;
 }

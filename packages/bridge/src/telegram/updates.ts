@@ -11,7 +11,7 @@
  */
 import type { Logger } from "../log.ts";
 import type { Allowlist } from "./allowlist.ts";
-import { TelegramApiError, type TelegramApi, type TelegramUpdate } from "./api.ts";
+import { TelegramApiError, failureSummary, type TelegramApi, type TelegramUpdate } from "./api.ts";
 
 /** Shown to an authorised user who writes in the private main chat. */
 export const TOPIC_INSTRUCTION = "请在私聊 topic 中使用";
@@ -51,6 +51,22 @@ export interface InboundMessage {
   readonly mediaGroupId?: string;
 }
 
+/**
+ * A message whose media the bridge cannot put in a prompt.
+ *
+ * It is delivered rather than dropped because the sender is authorised and
+ * waiting for an answer: the runtime replies once and the input goes no
+ * further. Issue #7 keeps these types outside the prompt path, so the caption
+ * of a video is never read as if it were a text turn.
+ */
+export interface InboundUnsupported {
+  readonly kind: "unsupported";
+  readonly updateId: number;
+  readonly thread: ThreadIdentity;
+  readonly userId: number;
+  readonly messageId: number;
+}
+
 export interface InboundCallback {
   readonly kind: "callback";
   readonly updateId: number;
@@ -61,7 +77,10 @@ export interface InboundCallback {
   readonly messageId: number;
 }
 
-export type InboundUpdate = InboundMessage | InboundCallback;
+export type InboundUpdate = InboundMessage | InboundUnsupported | InboundCallback;
+
+/** Message fields that carry media the Backend contract has no part for. */
+const UNSUPPORTED_MEDIA = ["video", "animation", "audio", "voice", "sticker", "video_note"] as const;
 
 /** Why an update produced nothing. Logged, never shown to the sender. */
 export type DropReason = "unauthorised" | "not-private" | "unsupported";
@@ -96,6 +115,14 @@ function classifyMessage(updateId: number, message: Record<string, unknown>): Up
   if (threadId === undefined) return { action: "instruct", updateId, chatId };
   if (userId === undefined || messageId === undefined) {
     return { action: "drop", updateId, reason: "unsupported" };
+  }
+  // Before any text is read: a caption belongs to its media, so media the
+  // bridge cannot send must not arrive at the backend as a text prompt.
+  if (UNSUPPORTED_MEDIA.some((field) => asRecord(message[field]) !== undefined)) {
+    return {
+      action: "deliver",
+      update: { kind: "unsupported", updateId, thread: { chatId, threadId }, userId, messageId },
+    };
   }
   const photo = readPhoto(message.photo);
   const document = readDocument(message.document);
@@ -287,7 +314,7 @@ async function apply(
     logger.error("telegram.update.failed", {
       updateId: update.updateId,
       threadId: update.thread.threadId,
-      errorSummary: error instanceof Error ? error.message : undefined,
+      errorSummary: failureSummary(error),
     });
   }
 }

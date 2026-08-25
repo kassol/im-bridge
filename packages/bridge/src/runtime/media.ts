@@ -29,11 +29,18 @@ const IMAGE_NAME_LIMIT = 255;
 const UNSAFE_IMAGE_NAME_PATTERN = /[\\/\u0000-\u001f\u007f]/u;
 
 /** Why an input never reached the backend. Each maps to one short reply. */
-export type MediaFailure = "too-many" | "unsupported-type" | "too-large" | "download-failed";
+export type MediaFailure =
+  | "too-many"
+  | "unsupported-type"
+  | "unsupported-message"
+  | "too-large"
+  | "download-failed";
 
 const NOTICES: Record<MediaFailure, string> = {
   "too-many": `一次最多 ${String(MAX_PROMPT_IMAGES)} 张图片。`,
   "unsupported-type": "不支持的图片类型。",
+  // Video, audio, stickers: the message never becomes prompt content at all.
+  "unsupported-message": "不支持的消息类型。",
   "too-large": "图片超过 5 MiB。",
   "download-failed": "图片下载失败。",
 };

@@ -41,6 +41,11 @@ export interface TelegramCallOptions {
   signal?: AbortSignal;
   /** Long polling owns its own reconnect backoff, so it passes 0. */
   maxRetries?: number;
+  /**
+   * True when the caller paces this method itself. A 429 is then handed back
+   * instead of slept here, so the pacer backs off exactly once.
+   */
+  pacedByCaller?: boolean;
 }
 
 export interface BotIdentity {
@@ -125,6 +130,23 @@ export class TelegramFileTooLargeError extends Error {
     this.name = "TelegramFileTooLargeError";
     this.limitBytes = limitBytes;
   }
+}
+
+/**
+ * A failure named by its type, never by its message.
+ *
+ * Telegram descriptions and backend messages are the only strings in the
+ * bridge that could quote what a user wrote, and both a log line and a dead
+ * letter outlive the failure, so what is written is composed from fields that
+ * cannot carry content.
+ */
+export function failureSummary(error: unknown): string {
+  if (error instanceof TelegramApiError) {
+    const code = error.errorCode === undefined ? "" : ` ${String(error.errorCode)}`;
+    return `telegram ${error.method} ${error.kind}${code}`;
+  }
+  if (error instanceof Error) return `${error.name} in update processing`;
+  return "unknown failure in update processing";
 }
 
 const DEFAULT_BASE_URL = "https://api.telegram.org";
@@ -314,9 +336,9 @@ export class TelegramApi {
    *
    * A draft is a 30-second preview that never enters history, and the same
    * `draft_id` supersedes the previous one, so a repeat changes nothing the
-   * user can see. It does not retry: drafts are paced by `StreamThrottle`, and
-   * the next flush carries fresher blocks than a retry of this one would, so
-   * sleeping inside the call would only delay newer content.
+   * user can see, which is why a dropped connection is retried like any other
+   * idempotent call. A 429 is not: drafts are paced by `StreamThrottle`, and
+   * it backs off once and then sends fresher blocks than a retry would carry.
    */
   async sendRichMessageDraft(draft: {
     chatId: number;
@@ -332,7 +354,7 @@ export class TelegramApi {
     payload.rich_message = { blocks: draft.blocks.map(toRichBlock) };
     await this.call("sendRichMessageDraft", payload, {
       retryClass: "idempotent",
-      maxRetries: 0,
+      pacedByCaller: true,
       signal: draft.signal,
     });
   }
@@ -450,7 +472,7 @@ export class TelegramApi {
       } catch (error) {
         if (options.signal?.aborted === true) throw error;
         if (!(error instanceof TelegramApiError)) throw error;
-        const delayMs = retryDelayMs(error, options.retryClass, attempt, maxRetries);
+        const delayMs = retryDelayMs(error, options.retryClass, attempt, maxRetries, options.pacedByCaller);
         if (delayMs === undefined) {
           this.#logger?.error("telegram.request.failed", {
             method,
@@ -575,12 +597,14 @@ function retryDelayMs(
   retryClass: TelegramRetryClass,
   attempt: number,
   maxRetries: number,
+  pacedByCaller = false,
 ): number | undefined {
   if (attempt > maxRetries) return undefined;
   // 429 is a rejection: Telegram delivered nothing, so even a final send may
   // repeat it. The wait is the complete value Telegram asked for, because the
-  // penalty escalates when it is not honoured.
-  if (error.retryAfterMs !== undefined) return error.retryAfterMs;
+  // penalty escalates when it is not honoured. A caller that paces itself gets
+  // it back instead, so the delay is honoured once rather than twice.
+  if (error.retryAfterMs !== undefined) return pacedByCaller ? undefined : error.retryAfterMs;
   if (retryClass === "final-send") return undefined;
   if (!error.transient) return undefined;
   return Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);

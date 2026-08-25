@@ -24,7 +24,12 @@ import { MemorySemaphore } from "../src/runtime/semaphore.ts";
 import { Store } from "../src/store/store.ts";
 import { Allowlist } from "../src/telegram/allowlist.ts";
 import { TelegramApi } from "../src/telegram/api.ts";
-import type { InboundDocument, InboundMessage, InboundPhotoSize } from "../src/telegram/updates.ts";
+import type {
+  InboundDocument,
+  InboundMessage,
+  InboundPhotoSize,
+  InboundUnsupported,
+} from "../src/telegram/updates.ts";
 import { FakeBackend } from "./fake-backend.ts";
 import { startFakeTelegram, type FakeCall, type FakeReply, type FakeTelegram } from "./fake-telegram.ts";
 
@@ -293,6 +298,31 @@ describe("image documents", () => {
 
     expect(calls("getFile")).toHaveLength(0);
     expect(textOf(lastCall("sendMessage"))).toBe(mediaNotice("too-large"));
+  });
+});
+
+describe("unsupported media", () => {
+  it("answers a captioned video once and sends nothing to the backend", async () => {
+    linkSession();
+    await start();
+    updateId += 1;
+    messageId += 1;
+    const video: InboundUnsupported = {
+      kind: "unsupported",
+      updateId,
+      thread: { chatId: CHAT, threadId: THREAD },
+      userId: AUTHORISED,
+      messageId,
+    };
+
+    await runtime.handleUpdate(video);
+
+    expect(backend.prompts).toHaveLength(0);
+    expect(calls("getFile")).toHaveLength(0);
+    expect(calls("sendMessage")).toHaveLength(1);
+    expect(textOf(lastCall("sendMessage"))).toBe(mediaNotice("unsupported-message"));
+    // The update reached an outcome, so polling may move past it.
+    expect(store.checkpoint()).toBe(video.updateId);
   });
 });
 

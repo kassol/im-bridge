@@ -20,7 +20,7 @@
  */
 import type { Logger } from "../log.ts";
 import type { ProcessingRecord, ProcessingStepPatch, Store } from "../store/store.ts";
-import { TelegramApiError } from "../telegram/api.ts";
+import { failureSummary } from "../telegram/api.ts";
 import { PLATFORM, type ThreadIdentity } from "../telegram/updates.ts";
 
 /** Attempts inside one process, including the first. */
@@ -164,22 +164,6 @@ export async function runProcessing(
     reason: DEAD_LETTER_EXHAUSTED,
     errorSummary: failureSummary(failure),
   });
-}
-
-/**
- * A failure named by its type, never by its message.
- *
- * Telegram descriptions and backend messages are the only strings in the
- * bridge that could quote what a user wrote, and a dead letter outlives the
- * process, so what is written here is composed from fields that cannot.
- */
-export function failureSummary(error: unknown): string {
-  if (error instanceof TelegramApiError) {
-    const code = error.errorCode === undefined ? "" : ` ${String(error.errorCode)}`;
-    return `telegram ${error.method} ${error.kind}${code}`;
-  }
-  if (error instanceof Error) return `${error.name} in update processing`;
-  return "unknown failure in update processing";
 }
 
 function beginRecord(store: Store, unit: ProcessingUnit, anchor: number): ProcessingRecord {

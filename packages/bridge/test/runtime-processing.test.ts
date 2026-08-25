@@ -30,7 +30,8 @@ const run = promisify(execFile);
 const TOKEN = "8123456789:AAF-abcdefghijklmnopqrstuvwxyz012345678";
 const AUTHORISED = 149523521;
 const STRANGER = 999000111;
-const CHAT = 5000;
+/** A private chat's id is the user's id, which is what recovery re-checks. */
+const CHAT = AUTHORISED;
 const THREAD = 31;
 const OTHER_THREAD = 32;
 const SESSION = "01j8z4qk9m7f3b2n6x5c4v-0001";
@@ -305,7 +306,7 @@ describe("albums", () => {
 
     // Collecting holds the checkpoint: the input is not delivered yet.
     expect(store.checkpoint()).toBe(0);
-    expect(store.findProcessing(group[0]!.updateId)?.updateKind).toBe("message");
+    expect(store.findProcessing(group[0]!.updateId)?.updateKind).toBe("album");
 
     await runtime.sealAlbums();
 
@@ -316,6 +317,43 @@ describe("albums", () => {
 });
 
 describe("crash recovery", () => {
+  it("isolates an interrupted album as an album, not as a message", async () => {
+    link(SESSION);
+    await start();
+    const group = [
+      message({ text: "看这些", mediaGroupId: "album-2" }),
+      message({ mediaGroupId: "album-2" }),
+    ];
+    for (const member of group) await runtime.handleUpdate(member);
+
+    // The process dies while the album is still collecting.
+    store.close();
+    const reopened = new Store(join(dir, "bridge.db"));
+    store = reopened;
+    const restarted = await start();
+    await restarted.recover();
+
+    expect(reopened.listDeadLetters().map((record) => record.updateKind)).toEqual(["album", "album"]);
+  });
+
+  it("keeps the resend notice out of a chat the allowlist no longer permits", async () => {
+    await start();
+    store.beginProcessing({
+      updateId: 500,
+      updateKind: "message",
+      platform: PLATFORM,
+      chatId: STRANGER,
+      threadId: THREAD,
+      step: STEP_QUEUED,
+    });
+
+    await runtime.recover();
+
+    expect(calls("sendMessage")).toHaveLength(0);
+    expect(store.listDeadLetters()).toHaveLength(1);
+    expect(lines.some((line) => line.includes("bridge.resend.skipped"))).toBe(true);
+  });
+
   it("isolates uncertain work, asks the topic to resend, and never retries it", async () => {
     link(SESSION);
     await start();

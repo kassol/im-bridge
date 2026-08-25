@@ -29,16 +29,23 @@
  * side effect, so a retry resumes from the last recorded step and a crash is
  * isolated instead of replayed.
  */
-import type { Backend, BackendEvent, PromptContent, Session } from "../backends/types.ts";
+import {
+  ApprovalNotPendingError,
+  type Backend,
+  type BackendEvent,
+  type PromptContent,
+  type Session,
+} from "../backends/types.ts";
 import type { Logger } from "../log.ts";
 import { LinkConflictError, type Link, type Store } from "../store/store.ts";
 import type { Allowlist } from "../telegram/allowlist.ts";
-import { TelegramApiError, type TelegramApi } from "../telegram/api.ts";
+import { TelegramApiError, failureSummary, type TelegramApi } from "../telegram/api.ts";
 import { headChars, splitFinalMarkdown } from "../telegram/markdown.ts";
 import {
   PLATFORM,
   type InboundCallback,
   type InboundMessage,
+  type InboundUnsupported,
   type InboundUpdate,
   type ThreadIdentity,
 } from "../telegram/updates.ts";
@@ -86,6 +93,9 @@ export { PLATFORM };
 
 /** How an album is named in its processing record and its dead letter. */
 const ALBUM_KIND = "album";
+
+/** The one reply every message outside the prompt path gets. */
+const UNSUPPORTED_MESSAGE_FAILURE = "unsupported-message";
 
 /** A backend message is quoted in a status line, not reproduced whole. */
 const NOTICE_LIMIT = 500;
@@ -357,6 +367,16 @@ export class BridgeRuntime {
       // An album is several records; the topic still lost one input.
       if (!isPrivateTopic(thread) || notified.has(key)) continue;
       notified.add(key);
+      // A private chat's id is the user's id, so the allowlist decides here
+      // too: a record left by an earlier configuration must not be answered.
+      if (!this.#allowlist.permits(thread.chatId)) {
+        this.#logger.info("bridge.resend.skipped", {
+          updateId: record.updateId,
+          threadId: record.threadId,
+          reason: "unauthorised",
+        });
+        continue;
+      }
       await this.#notify(thread, RESEND_NOTICE);
     }
     const purged = this.#store.purgeDeadLetters();
@@ -398,7 +418,7 @@ export class BridgeRuntime {
     }
     const unit: ProcessingUnit = {
       updateIds: [update.updateId],
-      kind: update.kind,
+      kind: unitKind(update),
       thread: update.thread,
     };
     markQueued(this.#store, unit);
@@ -418,11 +438,11 @@ export class BridgeRuntime {
       this.#albums.add(update.mediaGroupId, update);
       return;
     }
-    await runProcessing({ store: this.#store, logger: this.#logger }, unit, (progress) =>
-      update.kind === "callback"
-        ? this.#handleCallback(update, progress)
-        : this.#handleMessage(update, progress),
-    );
+    await runProcessing({ store: this.#store, logger: this.#logger }, unit, (progress) => {
+      if (update.kind === "callback") return this.#handleCallback(update, progress);
+      if (update.kind === "unsupported") return this.#handleUnsupported(update);
+      return this.#handleMessage(update, progress);
+    });
   }
 
   /** An album member collects only while it is a prompt for a linked session. */
@@ -458,6 +478,23 @@ export class BridgeRuntime {
       threadId: update.thread.threadId,
     });
     await this.#send(update.thread, unlinkedMenu(this.epoch, MESSAGE_DISCARDED_TEXT), progress);
+  }
+
+  /**
+   * Media the prompt path cannot carry.
+   *
+   * The reply is the whole outcome: nothing is downloaded, nothing reaches the
+   * backend, and the caption travelling with the media is never read. Sending
+   * it takes no processing step, because a repeat of this notice is harmless
+   * and the unit has no other effect to resume.
+   */
+  async #handleUnsupported(update: InboundUnsupported): Promise<void> {
+    this.#logger.info("bridge.prompt.rejected", {
+      updateId: update.updateId,
+      threadId: update.thread.threadId,
+      reason: UNSUPPORTED_MESSAGE_FAILURE,
+    });
+    await this.#notify(update.thread, mediaNotice(UNSUPPORTED_MESSAGE_FAILURE));
   }
 
   /**
@@ -627,7 +664,7 @@ export class BridgeRuntime {
           sessionId: event.sessionId,
           threadId: link.threadId,
           reason: event.type,
-          errorSummary: error instanceof Error ? error.message : undefined,
+          errorSummary: failureSummary(error),
         });
       })
       .finally(() => {
@@ -886,7 +923,7 @@ export class BridgeRuntime {
       // adapter forgets a request as soon as any client resolves it and
       // reports the next answer as an unknown request. Losing that race is a
       // normal outcome of a shared approval, not a failure to report.
-      if (!isUnknownApproval(error)) throw error;
+      if (!(error instanceof ApprovalNotPendingError)) throw error;
       this.#logger.info("bridge.approval.lost", { sessionId: pending.sessionId });
       return APPROVAL_ELSEWHERE_TEXT;
     }
@@ -1077,20 +1114,20 @@ export class BridgeRuntime {
   }
 }
 
+/**
+ * What this update's processing unit is called.
+ *
+ * A member of a media group is recorded as `album` from the start, because the
+ * unit it joins is the album: a crash before the group seals would otherwise
+ * leave a dead letter that calls a whole album one message.
+ */
+function unitKind(update: InboundUpdate): string {
+  return update.kind === "message" && update.mediaGroupId !== undefined ? ALBUM_KIND : update.kind;
+}
+
 /** One thread's lane in the scheduler, and its key in a notice set. */
 function threadKey(thread: ThreadIdentity): string {
   return `${String(thread.chatId)}:${String(thread.threadId)}`;
-}
-
-/**
- * How the dsh adapter reports a request it can no longer answer.
- *
- * The Backend contract has no error type for it, so the message is the signal.
- * A wrong guess here only costs one retry and a dead letter, never a duplicate
- * backend action.
- */
-function isUnknownApproval(error: unknown): boolean {
-  return error instanceof Error && error.message.startsWith("Unknown approval request");
 }
 
 /**

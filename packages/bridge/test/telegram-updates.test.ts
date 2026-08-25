@@ -206,6 +206,30 @@ describe("update filtering", () => {
     });
   });
 
+  it("normalizes a captioned video as unsupported instead of as text", async () => {
+    const { received } = await drain([
+      privateTopicMessage({
+        caption: "看看这个视频",
+        video: { file_id: "vid-1", width: 640, height: 480, duration: 12 },
+      }),
+      {
+        update_id: 11,
+        message: {
+          message_id: 78,
+          from: { id: AUTHORISED },
+          chat: { id: 5000, type: "private" },
+          message_thread_id: 31,
+          sticker: { file_id: "sticker-1", width: 512, height: 512 },
+        },
+      },
+    ]);
+
+    expect(received).toEqual([
+      { kind: "unsupported", updateId: 10, thread: { chatId: 5000, threadId: 31 }, userId: AUTHORISED, messageId: 77 },
+      { kind: "unsupported", updateId: 11, thread: { chatId: 5000, threadId: 31 }, userId: AUTHORISED, messageId: 78 },
+    ]);
+  });
+
   it("normalizes a callback query raised inside a topic", async () => {
     const { received } = await drain([
       {
@@ -369,5 +393,32 @@ describe("update loop lifecycle", () => {
       expect(line).not.toContain(TOKEN);
     }
     expect(lines.some((line) => (JSON.parse(line) as { reason?: string }).reason === "unauthorised")).toBe(true);
+  });
+
+  it("names a failed handler by its type and never by its message", async () => {
+    const marker = "把生产库删了";
+    const lines: string[] = [];
+    const controller = new AbortController();
+    const server = await fake((call) =>
+      call.count === 1 ? { json: { ok: true, result: [privateTopicMessage({ text: "prompt" })] } } : { hang: true },
+    );
+    const loop = runUpdateLoop({
+      api: new TelegramApi({ token: TOKEN, baseUrl: server.baseUrl }),
+      allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: memoryCheckpoint(),
+      logger: createLogger({ level: "debug", write: (line) => lines.push(line) }),
+      signal: controller.signal,
+      onUpdate: () => {
+        throw new Error(`backend refused: ${marker}`);
+      },
+    });
+    await waitFor(() => server.calls.filter((call) => call.method === "getUpdates").length === 2);
+    controller.abort();
+    await loop;
+
+    const failed = lines.filter((line) => line.includes("telegram.update.failed"));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toContain('"errorSummary":"Error in update processing"');
+    for (const line of lines) expect(line).not.toContain(marker);
   });
 });

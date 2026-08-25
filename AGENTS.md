@@ -90,6 +90,10 @@ respondApproval(requestId, ok)    回应审批请求
 close()                           关闭连接与后台重连
 ```
 
+契约还包含一个错误类型：`respondApproval` 遇到已被其他客户端答复的请求时抛
+`ApprovalNotPendingError`（`src/backends/types.ts`）。审批是广播的、先答者赢，
+platform 层必须能区分这种正常结果与真失败，所以它按类型判断，不读 backend 的错误文案。
+
 platform 层只认这个接口，**不许 import 任何 backend 专有类型**。
 dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸收掉。
 
@@ -267,6 +271,19 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：代码评审修复。Backend 契约新增 `ApprovalNotPendingError`，dsh adapter 抛它、
+  runtime 按 `instanceof` 判断，不再匹配错误文案；`failureSummary` 移到 `src/telegram/api.ts`，
+  `bridge.event.failed` 与 `telegram.update.failed` 只记错误类型，异常消息不再进日志；
+  `live/e2e.ts` 两处空 catch 改为写脱敏证据行；菜单标签改用 `headChars` 按字符截断，
+  不再劈开代理对；`video` / `animation` / `audio` / `voice` / `sticker` / `video_note`
+  在 `src/telegram/updates.ts` 归一化为 `unsupported`，runtime 只回一句「不支持的消息类型。」，
+  caption 不再当文字 prompt 发给 backend；审批消息带上工具名（`toolName: reason`）；
+  `sendRichMessageDraft` 恢复默认的 3 次幂等重试，429 仍原样抛给 `StreamThrottle`
+  （新增 `pacedByCaller`，退避只发生一次）；启动恢复的重发提示重新校验白名单
+  （私聊 chat_id 即 user id），不在白名单只记 `bridge.resend.skipped`；相册成员从入队起
+  就按 `album` 记录，崩溃恢复的 dead letter 不再写成 `message`；`topic detect` / `probe` /
+  `soleAllowedUserId` / `readNumberFlag` 导出并可注入 base URL，服务只在 `src/index.ts`
+  是进程入口时启动。新增 12 项单测（共 297）。
 - 2026-08-25：补齐服务边界与部署路径。**下面这些只用假件验证过，实机运行尚未进行**：
   `BridgeRuntime.shutdown({ deadlineMs })`（`src/runtime/runtime.ts`）按固定顺序
   中止轮询 → 停止接收新 update → 立即封口相册 → 最多等 20 秒排空 update / 图片 /

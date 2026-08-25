@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DshBackend } from "../src/backends/dsh.ts";
-import type { PromptContent } from "../src/backends/types.ts";
+import { ApprovalNotPendingError, type PromptContent } from "../src/backends/types.ts";
 
 interface CapturedRequest {
   path: string;
@@ -765,6 +765,8 @@ describe("DshBackend event downlinks", () => {
       },
     });
     await expect(backend.respondApproval("missing", false)).rejects.toThrow("Unknown approval request");
+    // The platform layer selects on the type; it never reads this message.
+    await expect(backend.respondApproval("missing", false)).rejects.toBeInstanceOf(ApprovalNotPendingError);
     unsubscribe();
     await backend.close();
   });
@@ -810,7 +812,7 @@ describe("DshBackend event downlinks", () => {
       { type: "output", sessionId: "s-1", text: "hel" },
       { type: "thinking", sessionId: "s-1", text: "why" },
       { type: "turn-end", sessionId: "s-1", text: "hello" },
-      { type: "approval", sessionId: "s-1", requestId: "rpc-approval", prompt: "run command" },
+      { type: "approval", sessionId: "s-1", requestId: "rpc-approval", prompt: "bash: run command" },
       { type: "error", sessionId: "s-2", message: "model failed" },
     ]);
     unsubscribe();

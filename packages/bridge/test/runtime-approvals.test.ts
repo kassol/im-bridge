@@ -10,7 +10,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Session } from "../src/backends/types.ts";
 import { createLogger, type Logger } from "../src/log.ts";
 import { encodeCallback } from "../src/runtime/callbacks.ts";
@@ -51,6 +51,7 @@ let dir: string;
 let store: Store;
 let backend: FakeBackend;
 let server: FakeTelegram;
+let api: TelegramApi;
 let runtime: BridgeRuntime;
 let lines: string[];
 let updateId = 200;
@@ -69,8 +70,9 @@ async function start(): Promise<void> {
     if (call.method === "answerCallbackQuery") return { json: { ok: true, result: true } };
     return { json: { ok: true, result: { message_id: APPROVAL_MESSAGE } } };
   });
+  api = new TelegramApi({ token: TOKEN, baseUrl: server.baseUrl });
   runtime = new BridgeRuntime({
-    api: new TelegramApi({ token: TOKEN, baseUrl: server.baseUrl }),
+    api,
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
@@ -89,6 +91,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   store.close();
   rmSync(dir, { recursive: true, force: true });
   await server.close();
@@ -139,6 +142,22 @@ function callback(data: string, fields: Partial<InboundCallback> = {}): InboundC
     ...fields,
   };
 }
+
+describe("failure reporting", () => {
+  it("names a failed approval message by its type and never by its message", async () => {
+    const marker = "把生产库删了";
+    link();
+    await start();
+    vi.spyOn(api, "sendMessage").mockRejectedValue(new Error(`send refused: ${marker}`));
+
+    await backend.emit({ type: "approval", sessionId: SESSION, requestId: REQUEST, prompt: "运行 bash" });
+
+    const failed = lines.filter((line) => line.includes("bridge.event.failed"));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toContain('"errorSummary":"Error in update processing"');
+    for (const line of lines) expect(line).not.toContain(marker);
+  });
+});
 
 describe("asking", () => {
   it("posts one Chinese message with allow-once and reject buttons", async () => {
@@ -224,9 +243,7 @@ describe("answering", () => {
   it("shows a request another client resolved as handled elsewhere", async () => {
     link();
     await start();
-    backend.respondApprovalWith = (requestId) => {
-      throw new Error(`Unknown approval request: ${requestId}`);
-    };
+    backend.answerElsewhere();
     const buttons = await ask();
 
     await runtime.handleUpdate(callback(buttons.get("允许一次") ?? ""));

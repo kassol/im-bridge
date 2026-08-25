@@ -144,6 +144,32 @@ describe("TelegramApi transport", () => {
     expect(slept).toEqual([]);
   });
 
+  it("retries a dropped draft connection and leaves a throttled draft to its pacer", async () => {
+    const draft = {
+      chatId: 5,
+      threadId: 9,
+      draftId: 1,
+      blocks: [{ type: "paragraph", text: "hi" }] as const,
+    };
+    const slept: number[] = [];
+    const server = await fake((call) => (call.count === 1 ? { destroy: true } : { json: { ok: true, result: true } }));
+
+    await expect(apiFor(server, { slept }).sendRichMessageDraft(draft)).resolves.toBeUndefined();
+    expect(server.calls).toHaveLength(2);
+    expect(slept).toEqual([1_000]);
+
+    // The stream throttle owns the draft cadence: it backs off once and sends
+    // fresher blocks, so the call must not sleep the delay a second time.
+    const throttled = await fake(() => ({
+      status: 429,
+      json: { ok: false, error_code: 429, parameters: { retry_after: 5 } },
+    }));
+    const paced: number[] = [];
+    await expect(apiFor(throttled, { slept: paced }).sendRichMessageDraft(draft)).rejects.toThrow(TelegramApiError);
+    expect(throttled.calls).toHaveLength(1);
+    expect(paced).toEqual([]);
+  });
+
   it("classifies a lost connection as retryable for reads and final for sends", async () => {
     const server = await fake(() => ({ json: IDENTITY }));
     await server.close();

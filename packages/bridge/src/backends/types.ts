@@ -55,6 +55,21 @@ export type BackendEvent =
 
 export type BackendEventHandler = (event: BackendEvent) => void | Promise<void>;
 
+/**
+ * The request named by `respondApproval` is no longer pending.
+ *
+ * An approval is broadcast to every client of a backend and the first answer
+ * wins, so losing that race is a normal outcome the platform layer renders
+ * rather than a failure. It is part of the contract as a type because the
+ * platform layer must never read a backend's error text to tell them apart.
+ */
+export class ApprovalNotPendingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApprovalNotPendingError";
+  }
+}
+
 export interface Backend {
   /** Stable name, used in logs and in the link table. */
   readonly name: string;

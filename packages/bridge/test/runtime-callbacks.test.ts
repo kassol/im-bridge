@@ -123,4 +123,16 @@ describe("session menus", () => {
     expect(sessionLabel(untitled, undefined)).toBe("未知目录 abcd1234");
     expect(sessionLabel(untitled, "work")).not.toContain("/private");
   });
+
+  it("cuts an oversized title by characters, never through an emoji", () => {
+    // The cut lands exactly on the emoji: by code unit it would split the
+    // surrogate pair and leave half a character on the button.
+    const title = `${"标".repeat(38)}\u{1f600}${"尾".repeat(10)}`;
+    const session: Session = { sessionId: "01j8-abcd1234", running: false, title };
+
+    const label = sessionLabel(session, "work");
+
+    expect(label).toBe(`${"标".repeat(38)}\u{1f600}…`);
+    expect([...label]).toHaveLength(40);
+  });
 });

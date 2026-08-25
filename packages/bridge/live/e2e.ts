@@ -255,7 +255,11 @@ async function main(): Promise<void> {
   } finally {
     unsubscribe();
     await runtime.shutdown({ reason: "live-e2e" });
-    await loop.catch(() => undefined);
+    // The drain closes the Store the loop settles against, so the loop ends by
+    // failing. It is evidence, not silence: only the error's name is written.
+    await loop.catch((error: unknown) => {
+      checklist.note("live.poll.ended", { reason: errorName(error) });
+    });
     rmSync(dir, { recursive: true, force: true });
   }
 
@@ -553,7 +557,11 @@ async function proveMultipartFailure(harness: Harness): Promise<void> {
  */
 async function proveRestartRecovery(harness: Harness): Promise<void> {
   const link = requireLink(harness);
-  const pending = harness.runtime.handleUpdate(textUpdate(harness, LONG_TASK_TEXT)).catch(() => undefined);
+  const pending = harness.runtime.handleUpdate(textUpdate(harness, LONG_TASK_TEXT)).catch((error: unknown) => {
+    // The scheduled restart interrupts this unit; the failure is expected and
+    // is recorded by name, the way `bridge.poll.aborted` records one.
+    harness.checklist.note("live.restart.interrupted", { reason: errorName(error) });
+  });
   await harness.events.next(
     (event) => event.type === "output" && event.sessionId === link.sessionId,
     AGENT_TIMEOUT_MS,
@@ -622,6 +630,11 @@ async function waitFor(check: () => boolean, what: string, timeoutMs = AGENT_TIM
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`timed out waiting for ${what}`);
+}
+
+/** A failure as evidence may carry it: its type, never its message. */
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : "unknown";
 }
 
 function soleAllowedUserId(config: BridgeConfig): number {
