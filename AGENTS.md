@@ -221,7 +221,9 @@ This repository uses a single-context domain documentation layout. See `docs/age
 
 ```bash
 pnpm i
-pnpm -F bridge dev        # 起 bridge
+# 起 bridge，唯一参数是 600 权限的配置文件路径（不要写 `--`，pnpm 会把它原样传给 node）
+pnpm -F bridge start <config.json>
+pnpm -F bridge dev <config.json>       # 同上，改动即重启
 pnpm -F bridge test       # 单测
 pnpm -F bridge typecheck  # 类型检查
 
@@ -234,6 +236,26 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：落地 Telegram 传输层与配置基线。配置改为单一 JSON 文件
+  （`src/config.ts`，属主为当前 uid、mode 0600，token / 白名单 / cwd alias /
+  数据库路径 / dsh URL / 日志级别），env 配置路径删除；新增 JSON Lines 日志
+  （`src/log.ts`，字段白名单，结构上无法写入 token 与用户内容）；新增 Bot API
+  适配器（`src/telegram/api.ts`，可注入 base URL、`getMe` 强制 threaded mode、
+  50s/60s long polling、按幂等性分类重试、429 等满 `retry_after`、最终发送不重试）
+  与 update 校验加轮询循环（`src/telegram/updates.ts`，白名单先于一切、私聊 topic
+  才是 thread、主聊天回固定中文指引、1→30s 重连退避）。`src/index.ts` 改为
+  argv 传配置路径并在 SIGTERM/SIGINT 中止轮询。新增 44 项单测（fake Telegram HTTP）。
+- 2026-08-25：持久化升级到 SQLite schema v2，`LinkStore` 更名为 `Store`
+  （`src/store/store.ts`）。`PRAGMA user_version` 驱动有序迁移，旧库按 v1 处理；
+  link 双向唯一，`link()` 不再改绑，冲突抛 `LinkConflictError`，迁移遇到重复 session
+  抛 `MigrationConflictError` 并报出冲突 thread、原样保留数据。新增 polling checkpoint
+  （最高连续 update id）、update processing 记录（步骤 / 外部实体 id / 分片计数 /
+  尝试次数，无 prompt 与图片字段）、启动恢复转 dead letter 并回传 thread 标识、
+  dead letter 列表与 30 天清理。28 项 store 单测。
+- 2026-08-25：Backend 契约落地七动作。`sendPrompt` 与 `steer` 统一接收 prompt content
+  （有序 text / image 部分，图片限 JPEG、PNG、WebP，携带 base64 数据与可选安全文件名）；
+  dsh adapter 映射到 `session.prompt` 的 queue / steer 模式，非法 content 在发出 HTTP 前失败。
+  ADR 0002 补上被 ADR 0003 取代的交叉引用。
 - 2026-08-24：完成 Telegram platform loop 设计，见
   `docs/adr/0003-telegram-platform-loop.md`。Backend 契约加入结构化 prompt content 与
   `steer`，成为七动作；确认私聊 topic 菜单、Rich Message 流式与最终落地、图片输入、

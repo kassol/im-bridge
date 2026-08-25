@@ -1,44 +1,62 @@
 /**
  * Entry point.
  *
- * Wiring only: read configuration, fail fast on anything missing, and report
- * what would run. Backend and platform loops are not implemented yet.
+ * The LaunchAgent passes one argument: the path of the configuration file.
+ * Startup validates that file, proves the bot can work in topics, and then
+ * polls Telegram. Link and turn behavior arrive with the runtime; until then
+ * an authorised update is only logged.
  */
+import { loadConfig } from "./config.ts";
+import { createLogger } from "./log.ts";
+import { Store } from "./store/store.ts";
 import { Allowlist } from "./telegram/allowlist.ts";
-import { LinkStore } from "./store/links.ts";
+import { TelegramApi } from "./telegram/api.ts";
+import { runUpdateLoop } from "./telegram/updates.ts";
 
-function required(name: string): string {
-  const value = process.env[name];
-  if (value === undefined || value.trim() === "") {
-    throw new Error(`Missing required environment variable: ${name}`);
+async function main(): Promise<void> {
+  const configPath = process.argv[2];
+  if (configPath === undefined) {
+    throw new Error("Usage: node --experimental-strip-types src/index.ts <config.json>");
   }
-  return value;
+  const config = await loadConfig(configPath);
+  const logger = createLogger({ level: config.logLevel });
+  const allowlist = new Allowlist(config.allowedUserIds);
+  const api = new TelegramApi({ token: config.botToken, logger });
+
+  // Fails on an invalid token and on a bot whose threaded mode is off, before
+  // any update is accepted.
+  const identity = await api.getMe();
+  const store = new Store(config.databasePath);
+  logger.info("bridge.started", { botId: identity.id, count: allowlist.size });
+
+  const controller = new AbortController();
+  const stop = (reason: string) => (): void => {
+    logger.info("bridge.stopping", { reason });
+    controller.abort();
+  };
+  // Minimal shutdown: stop polling and let the process exit. Draining active
+  // work is the graceful-shutdown ticket.
+  process.on("SIGTERM", stop("SIGTERM"));
+  process.on("SIGINT", stop("SIGINT"));
+
+  try {
+    await runUpdateLoop({
+      api,
+      allowlist,
+      logger,
+      signal: controller.signal,
+      onUpdate: () => {},
+    });
+  } finally {
+    store.close();
+    logger.info("bridge.stopped");
+  }
 }
 
-function main(): void {
-  // Presence is all we report. The token guards an agent that can run shell
-  // commands, so no part of it goes to stdout, which ends up in the log file.
-  required("TG_BOT_TOKEN");
-  const allowlist = Allowlist.fromEnv(process.env["TG_ALLOWED_USER_IDS"]);
-  const dshUrl = process.env["DSH_URL"] ?? "http://127.0.0.1:3080";
-  const dbPath = process.env["IM_BRIDGE_DB"] ?? "./im-bridge.db";
-
-  // Refuse to run with no allowlist: a bridge nobody may use is a bug, and
-  // starting up anyway invites someone to "fix" it by opening access.
-  if (allowlist.size === 0) {
-    throw new Error("TG_ALLOWED_USER_IDS is empty; refusing to start with no authorised users");
-  }
-
-  const links = new LinkStore(dbPath);
-
-  console.log("im-bridge configured");
-  console.log(`  backend      dsh @ ${dshUrl}`);
-  console.log("  platform     telegram (token configured)");
-  console.log(`  authorised   ${allowlist.size} user(s)`);
-  console.log(`  links        ${dbPath} (${links.list().length} existing)`);
-  console.log("Backend and platform loops are not implemented yet.");
-
-  links.close();
+try {
+  await main();
+} catch (error) {
+  // Configuration and startup errors carry no credential by construction.
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
 }
-
-main();
