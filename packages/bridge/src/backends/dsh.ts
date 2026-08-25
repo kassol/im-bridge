@@ -1,6 +1,13 @@
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, sep } from "node:path";
-import type { Backend, BackendEvent, BackendEventHandler, Session } from "./types.ts";
+import type {
+  Backend,
+  BackendEvent,
+  BackendEventHandler,
+  PromptContent,
+  PromptContentPart,
+  Session,
+} from "./types.ts";
 
 export interface DshLogger {
   debug?(message: string, details?: unknown): void;
@@ -23,6 +30,12 @@ interface RpcSuccess {
 
 const LIST_TIMEOUT_MS = 10_000;
 const ACTION_TIMEOUT_MS = 30_000;
+/** dsh also accepts image/gif on the wire; the bridge contract does not. */
+const PROMPT_IMAGE_MEDIA_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+const IMAGE_NAME_LIMIT = 255;
+/** Path separators and control characters must never reach a dsh attachment name. */
+const UNSAFE_IMAGE_NAME_PATTERN = /[\\/\u0000-\u001f\u007f]/;
 
 export class DshBackend implements Backend {
   readonly name = "dsh";
@@ -78,14 +91,13 @@ export class DshBackend implements Backend {
     return value.sessionId;
   }
 
-  async sendPrompt(sessionId: string, text: string): Promise<void> {
-    const value = await this.#rpc(
-      "session.prompt",
-      { sessionId, mode: "queue", content: [{ type: "text", text }] },
-      ACTION_TIMEOUT_MS,
-    );
-    if (!isRecord(value) || value.accepted !== true) throw new Error("dsh did not accept prompt");
-    this.#activeSessions.add(sessionId);
+  async sendPrompt(sessionId: string, content: PromptContent): Promise<void> {
+    await this.#prompt(sessionId, content, "queue");
+  }
+
+  /** dsh steers through the same call; only the mode differs. */
+  async steer(sessionId: string, content: PromptContent): Promise<void> {
+    await this.#prompt(sessionId, content, "steer");
   }
 
   subscribe(handler: BackendEventHandler): () => void {
@@ -396,6 +408,17 @@ export class DshBackend implements Backend {
     }
   }
 
+  async #prompt(sessionId: string, content: PromptContent, mode: "queue" | "steer"): Promise<void> {
+    validatePromptContent(content);
+    const value = await this.#rpc(
+      "session.prompt",
+      { sessionId, mode, content: content.map(toWireContentPart) },
+      ACTION_TIMEOUT_MS,
+    );
+    if (!isRecord(value) || value.accepted !== true) throw new Error("dsh did not accept prompt");
+    this.#activeSessions.add(sessionId);
+  }
+
   async #rpc(method: string, payload: unknown, timeoutMs: number): Promise<unknown> {
     this.#assertOpen();
     const rpcId = crypto.randomUUID();
@@ -578,6 +601,44 @@ function messageText(content: unknown): string | undefined {
     if (isRecord(block) && block.type === "text" && typeof block.text === "string") parts.push(block.text);
   }
   return parts.join("");
+}
+
+/**
+ * Reject content dsh would refuse, or that would put an unsafe attachment name
+ * on the wire, before the request leaves the process. Parts arrive from runtime
+ * platform data, so the adapter narrows them again.
+ */
+function validatePromptContent(content: PromptContent): void {
+  if (content.length === 0) throw new Error("Prompt content must have at least one part");
+  for (const part of content) {
+    if (part.type === "text") {
+      if (part.text.length === 0) throw new Error("Prompt text part must not be empty");
+      continue;
+    }
+    if (!PROMPT_IMAGE_MEDIA_TYPES.includes(part.mediaType)) {
+      throw new Error(`Unsupported prompt image media type: ${part.mediaType}`);
+    }
+    if (part.data.length === 0 || part.data.length % 4 !== 0 || !BASE64_PATTERN.test(part.data)) {
+      throw new Error("Prompt image data must be base64");
+    }
+    if (part.name !== undefined && !isSafeImageName(part.name)) {
+      throw new Error(`Unsafe prompt image name: ${part.name}`);
+    }
+  }
+}
+
+function isSafeImageName(name: string): boolean {
+  if (name.length === 0 || name.length > IMAGE_NAME_LIMIT) return false;
+  if (name === "." || name === "..") return false;
+  return !UNSAFE_IMAGE_NAME_PATTERN.test(name);
+}
+
+/** `name` is optional on the dsh wire, so omit the field instead of sending a blank. */
+function toWireContentPart(part: PromptContentPart): Record<string, unknown> {
+  if (part.type === "text") return { type: "text", text: part.text };
+  const image: Record<string, unknown> = { type: "image", mediaType: part.mediaType, data: part.data };
+  if (part.name !== undefined) image.name = part.name;
+  return image;
 }
 
 function isInside(root: string, target: string): boolean {

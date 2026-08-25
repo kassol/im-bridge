@@ -43,6 +43,12 @@ The backend contract has six actions:
 `close()` stops reconnect loops, closes downlinks, clears pending approvals, and
 waits for dispatch work to stop.
 
+ADR 0003 supersedes this list. The contract now has seven actions: `sendPrompt`
+and `steer` both take prompt content, an ordered list of text and image parts.
+The adapter maps `sendPrompt` to `session.prompt` with queue mode and `steer` to
+the same call with steer mode. Every other decision in this ADR still holds, and
+`steer` shares the prompt request timeout.
+
 ### Construction and cwd security
 
 `DshBackend` publicly accepts only its base URL, an injected logger, and one or

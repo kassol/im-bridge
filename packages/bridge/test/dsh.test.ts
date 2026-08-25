@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DshBackend } from "../src/backends/dsh.ts";
+import type { PromptContent } from "../src/backends/types.ts";
 
 interface CapturedRequest {
   path: string;
@@ -134,7 +135,7 @@ describe("DshBackend unary actions", () => {
       { sessionId: "s-1", running: true, cwd: "/work" },
     ]);
     await expect(backend.createSession(cwd)).resolves.toBe("s-2");
-    await expect(backend.sendPrompt("s-2", "hello")).resolves.toBeUndefined();
+    await expect(backend.sendPrompt("s-2", [{ type: "text", text: "hello" }])).resolves.toBeUndefined();
     await backend.close();
 
     expect(requests.map(({ path, body }) => ({ path, method: (body as { method: string }).method }))).toEqual([
@@ -195,10 +196,15 @@ describe("DshBackend unary actions", () => {
     controllers[0]?.abort(new DOMException("timed out", "TimeoutError"));
     await expect(listing).rejects.toThrow("session.list request failed");
 
-    const prompting = backend.sendPrompt("s-1", "hello");
+    const prompting = backend.sendPrompt("s-1", [{ type: "text", text: "hello" }]);
     expect(timeoutMs).toEqual([10_000, 30_000]);
     controllers[1]?.abort(new DOMException("timed out", "TimeoutError"));
     await expect(prompting).rejects.toThrow("session.prompt request failed");
+
+    const steering = backend.steer("s-1", [{ type: "text", text: "instead do this" }]);
+    expect(timeoutMs).toEqual([10_000, 30_000, 30_000]);
+    controllers[2]?.abort(new DOMException("timed out", "TimeoutError"));
+    await expect(steering).rejects.toThrow("session.prompt request failed");
     await backend.close();
   });
 
@@ -223,6 +229,88 @@ describe("DshBackend unary actions", () => {
   });
 });
 
+describe("DshBackend prompt content", () => {
+  it("keeps part order and maps queue and steer modes to session.prompt", async () => {
+    const requests: CapturedRequest[] = [];
+    const baseUrl = await startHttpServer(async (request, response) => {
+      const body = await readJson(request);
+      requests.push({ path: request.url ?? "", body });
+      respond(response, (body as { rpcId: string }).rpcId, { accepted: true });
+    });
+    const root = await mkdtemp(join(tmpdir(), "dsh-root-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const backend = new DshBackend({ baseUrl, allowedCwdRoots: [root] });
+    const content: PromptContent = [
+      { type: "text", text: "describe both" },
+      { type: "image", mediaType: "image/png", data: "aGVsbG8=", name: "shot.png" },
+      { type: "image", mediaType: "image/webp", data: "aGk=" },
+      { type: "text", text: "in order" },
+    ];
+
+    await backend.sendPrompt("s-1", content);
+    await backend.steer("s-1", [{ type: "image", mediaType: "image/jpeg", data: "aGk=" }]);
+    await backend.close();
+
+    expect(requests.map(({ path }) => path)).toEqual(["/api/session.prompt", "/api/session.prompt"]);
+    expect((requests[0]?.body as { payload: unknown }).payload).toEqual({
+      sessionId: "s-1",
+      mode: "queue",
+      content: [
+        { type: "text", text: "describe both" },
+        { type: "image", mediaType: "image/png", data: "aGVsbG8=", name: "shot.png" },
+        { type: "image", mediaType: "image/webp", data: "aGk=" },
+        { type: "text", text: "in order" },
+      ],
+    });
+    const queued = (requests[0]?.body as { payload: { content: Array<Record<string, unknown>> } }).payload;
+    expect("name" in (queued.content[2] ?? {})).toBe(false);
+    expect((requests[1]?.body as { payload: unknown }).payload).toEqual({
+      sessionId: "s-1",
+      mode: "steer",
+      content: [{ type: "image", mediaType: "image/jpeg", data: "aGk=" }],
+    });
+  });
+
+  it("rejects invalid prompt content before any HTTP request", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const root = await mkdtemp(join(tmpdir(), "dsh-root-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const backend = new DshBackend({ baseUrl: "http://127.0.0.1:3080", allowedCwdRoots: [root], logger: {} });
+    // Content crosses the seam from runtime Telegram data, so the adapter narrows it again.
+    const gif = [{ type: "image", mediaType: "image/gif", data: "aGk=" }] as unknown as PromptContent;
+
+    await expect(backend.sendPrompt("s-1", [])).rejects.toThrow("at least one part");
+    await expect(backend.sendPrompt("s-1", [{ type: "text", text: "" }])).rejects.toThrow("text part must not be empty");
+    await expect(backend.steer("s-1", gif)).rejects.toThrow("Unsupported prompt image media type");
+    await expect(backend.sendPrompt("s-1", [{ type: "image", mediaType: "image/png", data: "not base64" }]))
+      .rejects.toThrow("must be base64");
+    await expect(backend.steer("s-1", [{ type: "image", mediaType: "image/png", data: "aGk=", name: "../escape.png" }]))
+      .rejects.toThrow("Unsafe prompt image name");
+    await expect(backend.sendPrompt("s-1", [{ type: "image", mediaType: "image/png", data: "aGk=", name: "" }]))
+      .rejects.toThrow("Unsafe prompt image name");
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    await backend.close();
+  });
+
+  it("rejects a refused prompt and every prompt after close", async () => {
+    const baseUrl = await startHttpServer(async (request, response) => {
+      const body = await readJson(request) as { rpcId: string };
+      respond(response, body.rpcId, { accepted: false });
+    });
+    const root = await mkdtemp(join(tmpdir(), "dsh-root-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const backend = new DshBackend({ baseUrl, allowedCwdRoots: [root] });
+    const content: PromptContent = [{ type: "text", text: "hello" }];
+
+    await expect(backend.sendPrompt("s-1", content)).rejects.toThrow("dsh did not accept prompt");
+    await expect(backend.steer("s-1", content)).rejects.toThrow("dsh did not accept prompt");
+    await backend.close();
+    await expect(backend.sendPrompt("s-1", content)).rejects.toThrow("DshBackend is closed");
+    await expect(backend.steer("s-1", content)).rejects.toThrow("DshBackend is closed");
+  });
+});
+
 describe("DshBackend event downlinks", () => {
   it("terminates a prompt accepted before the first chunk when mux disconnects", async () => {
     const server = await startDshServer(async (request, response) => {
@@ -235,7 +323,7 @@ describe("DshBackend event downlinks", () => {
     const events: Array<{ type: string; sessionId: string }> = [];
     const unsubscribe = backend.subscribe((event) => { events.push(event); });
     await waitFor(() => server.connections.length === 2);
-    await backend.sendPrompt("s-active", "hello");
+    await backend.sendPrompt("s-active", [{ type: "text", text: "hello" }]);
     server.disconnect("/api/events.mux");
     await waitFor(() => events.some((event) => event.type === "error" && event.sessionId === "s-active"));
     unsubscribe();

@@ -19,6 +19,20 @@ export interface Session {
   title?: string;
 }
 
+/** Image formats a prompt content part may carry. */
+export type PromptImageMediaType = "image/jpeg" | "image/png" | "image/webp";
+
+/** One piece of a prompt: text, or an image carried as base64 data. */
+export type PromptContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; mediaType: PromptImageMediaType; data: string; name?: string };
+
+/**
+ * One atomic input for a session, as an ordered list of parts. Starting a turn
+ * and steering a running turn take the same shape.
+ */
+export type PromptContent = readonly PromptContentPart[];
+
 /**
  * Events a backend can emit, normalised across backends.
  *
@@ -50,7 +64,11 @@ export interface Backend {
   /** Create a session and return its id. */
   createSession(cwd: string): Promise<string>;
 
-  sendPrompt(sessionId: string, text: string): Promise<void>;
+  /** Start a turn on an idle session. */
+  sendPrompt(sessionId: string, content: PromptContent): Promise<void>;
+
+  /** Feed content into the turn a session is already running. */
+  steer(sessionId: string, content: PromptContent): Promise<void>;
 
   /**
    * Subscribe to the event stream. Returns an unsubscribe function.
