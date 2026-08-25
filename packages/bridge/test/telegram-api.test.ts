@@ -218,3 +218,55 @@ describe("TelegramApi transport", () => {
     expect(server.calls).toHaveLength(1);
   });
 });
+
+describe("menu methods", () => {
+  it("sends an inline keyboard in Telegram's field names", async () => {
+    const server = await fake(() => ({ json: { ok: true, result: { message_id: 900 } } }));
+    await apiFor(server).sendMessage({
+      chatId: 5000,
+      threadId: 31,
+      text: "菜单",
+      replyMarkup: [[{ text: "关闭", callbackData: "epoch1:x:" }]],
+    });
+    expect(server.calls[0]?.body).toEqual({
+      chat_id: 5000,
+      message_thread_id: 31,
+      text: "菜单",
+      reply_markup: { inline_keyboard: [[{ text: "关闭", callback_data: "epoch1:x:" }]] },
+    });
+  });
+
+  it("treats an edit Telegram calls unmodified as already applied", async () => {
+    const server = await fake(() => ({
+      status: 400,
+      json: { ok: false, error_code: 400, description: "Bad Request: message is not modified" },
+    }));
+    const api = apiFor(server);
+    await expect(
+      api.editMessageText({ chatId: 5000, messageId: 900, text: "菜单", replyMarkup: [] }),
+    ).resolves.toBeUndefined();
+    await expect(api.editMessageReplyMarkup({ chatId: 5000, messageId: 900 })).resolves.toBeUndefined();
+    expect(server.calls).toHaveLength(2);
+    expect(server.calls[1]?.body).toEqual({ chat_id: 5000, message_id: 900 });
+  });
+
+  it("reports any other edit failure", async () => {
+    const server = await fake(() => ({
+      status: 400,
+      json: { ok: false, error_code: 400, description: "Bad Request: message to edit not found" },
+    }));
+    await expect(
+      apiFor(server).editMessageText({ chatId: 5000, messageId: 900, text: "菜单" }),
+    ).rejects.toBeInstanceOf(TelegramApiError);
+  });
+
+  it("answers a callback query with an alert", async () => {
+    const server = await fake(() => ({ json: { ok: true, result: true } }));
+    await apiFor(server).answerCallbackQuery({ callbackId: "cb-1", text: "已解除绑定", showAlert: true });
+    expect(server.calls[0]?.body).toEqual({
+      callback_query_id: "cb-1",
+      text: "已解除绑定",
+      show_alert: true,
+    });
+  });
+});

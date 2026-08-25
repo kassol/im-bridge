@@ -56,7 +56,9 @@ pi 没有会话列表接口，也无法定向订阅某个会话的事件。给 p
 packages/bridge/src/
   backends/        backend adapter。每个 backend 实现同一个接口
   telegram/        Telegram 平台适配：收 update、发消息、渲染
-  store/           SQLite link 表
+  runtime/         update 编排：私聊 topic 管理菜单、callback 校验、link 变更
+  store/           SQLite schema v2：link 表、polling checkpoint、
+                   update processing 记录、dead letter
 docs/              实测结论与协议记录
   adr/             架构决策记录
   agents/          engineering skills 配置
@@ -236,6 +238,19 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：落地私聊 topic 管理路径。新增 `src/runtime/`：`runtime.ts`
+  （`BridgeRuntime.handleUpdate` 作为 update 唯一入口，`/start` 说明入口、
+  `/manage` 按 unlinked / linked / invalid-link 出对应菜单、未绑定 topic 的消息丢弃正文
+  并弹菜单、未知命令给一句纠正加管理按钮）、`callbacks.ts`（callback data 带 process
+  epoch 与稳定键——cwd alias 或 session id 末 8 位，不含列表下标，编码时校验 64 字节上限）、
+  `menus.ts`（纯菜单视图，未绑定 session 每页 8 条，标签用 title 或 alias + 末 8 位，
+  不出现真实路径）。每次点击重新校验白名单、私聊 topic、epoch、当前 link、session 是否
+  仍在、cwd alias；重复点击幂等，旧进程按钮编辑成失效态，关闭移除键盘。link 严格一对一，
+  冲突时两边都不动并给中文结果；运行中的 session 拒绝解绑；解绑不删 backend session；
+  backend 侧被删的 session 显示为失效并提供解绑或重新检查。`telegram/api.ts` 增加
+  inline keyboard、`editMessageText` / `editMessageReplyMarkup` / `answerCallbackQuery`
+  （幂等重试类，`message is not modified` 视为已生效）。`index.ts` 用配置里的 alias 目录
+  作为 dsh 允许的 cwd root 构造 backend 并接上 runtime。新增 45 项单测。
 - 2026-08-25：落地 Telegram 传输层与配置基线。配置改为单一 JSON 文件
   （`src/config.ts`，属主为当前 uid、mode 0600，token / 白名单 / cwd alias /
   数据库路径 / dsh URL / 日志级别），env 配置路径删除；新增 JSON Lines 日志

@@ -46,6 +46,15 @@ export interface BotIdentity {
   readonly username: string;
 }
 
+/** One inline button. The callback data is opaque here; the runtime owns its shape. */
+export interface InlineKeyboardButton {
+  readonly text: string;
+  readonly callbackData: string;
+}
+
+/** Rows of inline buttons. An empty keyboard leaves a message with no buttons. */
+export type InlineKeyboard = readonly (readonly InlineKeyboardButton[])[];
+
 /** A Telegram update, still in wire shape. Wire types stay inside this directory. */
 export interface TelegramUpdate {
   readonly update_id: number;
@@ -153,11 +162,13 @@ export class TelegramApi {
     chatId: number;
     threadId?: number;
     text: string;
+    replyMarkup?: InlineKeyboard;
     signal?: AbortSignal;
   }): Promise<number> {
     const payload: Record<string, unknown> = { chat_id: message.chatId };
     if (message.threadId !== undefined) payload.message_thread_id = message.threadId;
     payload.text = message.text;
+    if (message.replyMarkup !== undefined) payload.reply_markup = toReplyMarkup(message.replyMarkup);
     const result = await this.call("sendMessage", payload, {
       retryClass: "final-send",
       signal: message.signal,
@@ -166,6 +177,77 @@ export class TelegramApi {
       throw new TelegramApiError({ method: "sendMessage", kind: "malformed", transient: false });
     }
     return result.message_id;
+  }
+
+  /**
+   * Replaces the text and the keyboard of a message this bot already sent.
+   *
+   * Retry class is `idempotent`: an edit names its target message and carries
+   * the complete new content, so repeating it converges on the same message
+   * instead of adding a second one. Telegram rejects an edit that would change
+   * nothing with "message is not modified"; that answer means the requested
+   * state already holds, so it counts as success.
+   */
+  async editMessageText(message: {
+    chatId: number;
+    messageId: number;
+    text: string;
+    replyMarkup?: InlineKeyboard;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const payload: Record<string, unknown> = {
+      chat_id: message.chatId,
+      message_id: message.messageId,
+      text: message.text,
+    };
+    if (message.replyMarkup !== undefined) payload.reply_markup = toReplyMarkup(message.replyMarkup);
+    await this.#edit("editMessageText", payload, message.signal);
+  }
+
+  /** Replaces only the keyboard. Omitting `replyMarkup` removes the buttons. */
+  async editMessageReplyMarkup(message: {
+    chatId: number;
+    messageId: number;
+    replyMarkup?: InlineKeyboard;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const payload: Record<string, unknown> = {
+      chat_id: message.chatId,
+      message_id: message.messageId,
+    };
+    if (message.replyMarkup !== undefined) payload.reply_markup = toReplyMarkup(message.replyMarkup);
+    await this.#edit("editMessageReplyMarkup", payload, message.signal);
+  }
+
+  /**
+   * Clears the loading spinner on a tapped button, optionally with a notice.
+   *
+   * Retry class is `idempotent`: the answer belongs to one callback id, so a
+   * repeat replaces nothing and creates nothing. An already-answered or
+   * expired query is a rejection Telegram reports without side effects.
+   */
+  async answerCallbackQuery(answer: {
+    callbackId: string;
+    text?: string;
+    showAlert?: boolean;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const payload: Record<string, unknown> = { callback_query_id: answer.callbackId };
+    if (answer.text !== undefined) payload.text = answer.text;
+    if (answer.showAlert === true) payload.show_alert = true;
+    await this.call("answerCallbackQuery", payload, {
+      retryClass: "idempotent",
+      signal: answer.signal,
+    });
+  }
+
+  async #edit(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+    try {
+      await this.call(method, payload, { retryClass: "idempotent", signal });
+    } catch (error) {
+      if (error instanceof TelegramApiError && isUnmodified(error)) return;
+      throw error;
+    }
   }
 
   /**
@@ -292,6 +374,20 @@ function readRetryAfterMs(errorCode: number, parameters: unknown): number | unde
   if (errorCode !== 429) return undefined;
   const seconds = isRecord(parameters) && typeof parameters.retry_after === "number" ? parameters.retry_after : 1;
   return Math.max(seconds, 1) * 1_000;
+}
+
+/** Wire shape of an inline keyboard. Telegram field names stop at this boundary. */
+function toReplyMarkup(keyboard: InlineKeyboard): Record<string, unknown> {
+  return {
+    inline_keyboard: keyboard.map((row) =>
+      row.map((button) => ({ text: button.text, callback_data: button.callbackData })),
+    ),
+  };
+}
+
+/** "message is not modified" reports that the edit was already applied. */
+function isUnmodified(error: TelegramApiError): boolean {
+  return error.errorCode === 400 && error.description?.includes("message is not modified") === true;
 }
 
 function summarize(error: unknown): string {

@@ -28,6 +28,8 @@ export interface LogFields {
   /** Bounded, Telegram- or bridge-authored. Never user content. */
   readonly errorSummary?: string;
   readonly reason?: string;
+  /** Menu action a callback asked for. Bridge-authored, never user content. */
+  readonly action?: string;
   readonly updateId?: number;
   readonly chatId?: number;
   readonly threadId?: number;

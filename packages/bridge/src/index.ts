@@ -3,11 +3,13 @@
  *
  * The LaunchAgent passes one argument: the path of the configuration file.
  * Startup validates that file, proves the bot can work in topics, and then
- * polls Telegram. Link and turn behavior arrive with the runtime; until then
- * an authorised update is only logged.
+ * polls Telegram. Every accepted update goes to the runtime, which owns the
+ * menus and the links.
  */
+import { DshBackend } from "./backends/dsh.ts";
 import { loadConfig } from "./config.ts";
 import { createLogger } from "./log.ts";
+import { BridgeRuntime } from "./runtime/runtime.ts";
 import { Store } from "./store/store.ts";
 import { Allowlist } from "./telegram/allowlist.ts";
 import { TelegramApi } from "./telegram/api.ts";
@@ -27,6 +29,12 @@ async function main(): Promise<void> {
   // any update is accepted.
   const identity = await api.getMe();
   const store = new Store(config.databasePath);
+  // A session may only be created inside a configured alias directory, so the
+  // alias map is also the backend's allowed cwd roots.
+  const backend = new DshBackend({
+    baseUrl: config.dshUrl,
+    allowedCwdRoots: [...config.cwdAliases.values()],
+  });
   logger.info("bridge.started", { botId: identity.id, count: allowlist.size });
 
   const controller = new AbortController();
@@ -39,15 +47,26 @@ async function main(): Promise<void> {
   process.on("SIGTERM", stop("SIGTERM"));
   process.on("SIGINT", stop("SIGINT"));
 
+  const runtime = new BridgeRuntime({
+    api,
+    backend,
+    store,
+    allowlist,
+    cwdAliases: config.cwdAliases,
+    logger,
+    signal: controller.signal,
+  });
+
   try {
     await runUpdateLoop({
       api,
       allowlist,
       logger,
       signal: controller.signal,
-      onUpdate: () => {},
+      onUpdate: (update) => runtime.handleUpdate(update),
     });
   } finally {
+    await backend.close();
     store.close();
     logger.info("bridge.stopped");
   }
