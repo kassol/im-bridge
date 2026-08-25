@@ -36,6 +36,8 @@ export interface ThreadSchedulerOptions {
 export class ThreadScheduler {
   readonly #maxThreads: number;
   readonly #lanes = new Map<string, Lane>();
+  /** Resolved once every lane is empty. Shutdown waits on these. */
+  readonly #drains = new Set<() => void>();
   #active = 0;
 
   constructor(options: ThreadSchedulerOptions = {}) {
@@ -45,6 +47,20 @@ export class ThreadScheduler {
   /** Threads with work, running or waiting. */
   get size(): number {
     return this.#lanes.size;
+  }
+
+  /**
+   * Resolves when nothing is running and nothing is queued.
+   *
+   * Shutdown uses it to wait out the work already admitted. It says nothing
+   * about work admitted afterwards, so a caller that must reach a quiet state
+   * checks `size` again after it resolves.
+   */
+  drain(): Promise<void> {
+    if (this.#idle()) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.#drains.add(resolve);
+    });
   }
 
   /**
@@ -96,5 +112,13 @@ export class ThreadScheduler {
     if (lane.tasks.length > 0) this.#lanes.set(key, lane);
     task.settle(failure);
     this.#pump();
+    if (!this.#idle()) return;
+    const waiting = [...this.#drains];
+    this.#drains.clear();
+    for (const resolve of waiting) resolve();
+  }
+
+  #idle(): boolean {
+    return this.#active === 0 && this.#lanes.size === 0;
   }
 }

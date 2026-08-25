@@ -64,10 +64,16 @@ packages/bridge/src/
                    turn 编排与流式草稿、图片与相册输入、图片内存预算、审批 UI
   store/           SQLite schema v2：link 表、polling checkpoint、
                    update processing 记录、dead letter
+packages/bridge/live/
+                   只手动跑的实机脚本，不进 vitest：`e2e.ts` 驱动真实
+                   Telegram + dsh 走完验收清单，`checklist.ts` 是纯粹的
+                   清单记账与证据脱敏（有单测）
 docs/              实测结论与协议记录
   adr/             架构决策记录
   agents/          engineering skills 配置
 scripts/           可重复的本机安装与运维向导
+  setup-dsh.sh     安装并验证 dsh 后端服务
+  setup-bridge.sh  写配置、跑测试与实机验证、安装 bridge LaunchAgent
 ```
 
 ## 核心抽象
@@ -237,6 +243,21 @@ pnpm -F bridge typecheck  # 类型检查
 # 列出被隔离的 update（每行一条 JSON，只有元数据；不启动轮询、不连 backend）
 pnpm -F bridge start <config.json> dead-letters list
 
+# 只校验配置文件，退出码 0/1（向导用它，不在 bash 里重写一遍校验）
+pnpm -F bridge start <config.json> config check
+
+# 等一条私聊 topic 里的消息，打印它的 chatId / threadId（bot 不能自己建私聊 topic）
+pnpm -F bridge start <config.json> topic detect
+
+# 安装前自检：getMe + threaded mode + 结构化草稿 + 最终 Rich Message
+pnpm -F bridge start <config.json> probe --thread <id>
+
+# 实机端到端（真 Telegram + 真 dsh + 临时数据库，按提示在 Telegram 里操作）
+pnpm -F bridge live:e2e <config.json> --thread <id>
+
+# bridge 服务（交互式收配置、跑测试与实机验证、安装 LaunchAgent 并验证）
+./scripts/setup-bridge.sh
+
 # dsh 后端（交互式安装、配置 LaunchAgent 并验证）
 ./scripts/setup-dsh.sh
 
@@ -246,6 +267,23 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：补齐服务边界与部署路径。**下面这些只用假件验证过，实机运行尚未进行**：
+  `BridgeRuntime.shutdown({ deadlineMs })`（`src/runtime/runtime.ts`）按固定顺序
+  中止轮询 → 停止接收新 update → 立即封口相册 → 最多等 20 秒排空 update / 图片 /
+  发送 → 关 Backend → 最后关 SQLite；到点仍在跑的活留着 processing 记录，交给下次
+  启动恢复转 dead letter 并提示重发，关机开始后到达的 update 既不记录也不结清，
+  checkpoint 不动，下次轮询会重新取到。`ThreadScheduler.drain()` 是排空的等待点。
+  第二个信号直接退出（`src/index.ts`）。新增本地命令 `config check` / `topic detect` /
+  `probe --thread`，以及 `packages/bridge/live/e2e.ts`（`pnpm -F bridge live:e2e`，
+  不进 vitest）。新增 `scripts/setup-bridge.sh`：七个阶段依次是预检 → 收配置 →
+  写并校验配置 → typecheck 与单测 → 真实 Bot API 的 Rich Message 自检 → 实机 E2E →
+  装 LaunchAgent 并等 `bridge.started`，任一阶段失败都回滚到原配置、原 plist、原服务。
+  token 只从静默输入经 stdin 进 600 权限的 `~/.config/im-bridge/config.json`，
+  不进命令行、不进 `wizard-values`、不进 plist、不进日志。plist 只传配置文件路径，
+  `RunAtLoad` 为真、`KeepAlive` 只在异常退出后重启。ADR 0001 补两条 2026-08-25
+  修订：env 文件被 JSON 配置取代；bridge 日志的 10MB × 5 轮转发生在每次安装时，
+  单次长跑期间不轮转。新增 45 项单测（关机 7、scheduler 2、live 清单 10、
+  向导生成产物 26）。
 - 2026-08-25：打通可靠 update 处理与审批。update 按 thread 串行、全局最多 4 个 thread
   同时跑（`src/runtime/scheduler.ts`：每 thread 一条 FIFO 队列，一个任务让出一次名额，
   忙 thread 不会压住等待中的 thread）。每个处理单元在第一个 Telegram / Backend 副作用

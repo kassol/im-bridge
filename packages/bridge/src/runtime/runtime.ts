@@ -124,8 +124,23 @@ export interface BridgeRuntimeOptions {
   logger: Logger;
   /** Injected by tests so callback data is predictable. */
   epoch?: string;
-  /** Aborting stops in-flight Telegram calls during shutdown. */
-  signal?: AbortSignal;
+  /**
+   * The polling loop's controller. `shutdown` aborts it first, so no further
+   * update is fetched while the work already admitted drains.
+   */
+  polling?: AbortController;
+}
+
+export interface ShutdownOptions {
+  /** How long active work may run before the process gives up on it. */
+  deadlineMs?: number;
+  /** Bounded label for the log line. A signal name, or why the loop ended. */
+  reason?: string;
+}
+
+export interface ShutdownOutcome {
+  /** False when work was still running at the deadline. */
+  readonly drained: boolean;
 }
 
 /**
@@ -154,6 +169,9 @@ interface Notice {
   readonly alert?: boolean;
 }
 
+/** ADR 0003: how long shutdown waits for update, media, and send work. */
+export const SHUTDOWN_DEADLINE_MS = 20_000;
+
 export class BridgeRuntime {
   readonly epoch: string;
 
@@ -163,7 +181,19 @@ export class BridgeRuntime {
   readonly #allowlist: Allowlist;
   readonly #cwdAliases: ReadonlyMap<string, string>;
   readonly #logger: Logger;
-  readonly #signal: AbortSignal | undefined;
+  readonly #polling: AbortController | undefined;
+  /**
+   * Cancels the runtime's own Telegram calls. It is aborted only after the
+   * Store is closed, so a send that outlived the drain deadline cannot come
+   * back, fail, and retire its own processing record.
+   */
+  readonly #work = new AbortController();
+  readonly #signal = this.#work.signal;
+  /** Cleared when shutdown starts. A later update is left for the next process. */
+  #accepting = true;
+  #shutdown: Promise<ShutdownOutcome> | undefined;
+  /** Renders in flight. They start from backend events, not from the scheduler. */
+  readonly #renders = new Set<Promise<void>>();
   /** Sessions mid-turn. Seeded from the backend, not from what the bridge sent. */
   readonly #active = new Set<string>();
   /** The live draft of each session that is streaming. */
@@ -196,7 +226,7 @@ export class BridgeRuntime {
     this.#allowlist = options.allowlist;
     this.#cwdAliases = options.cwdAliases;
     this.#logger = options.logger;
-    this.#signal = options.signal;
+    this.#polling = options.polling;
     this.epoch = options.epoch ?? createEpoch();
     this.#albums = new AlbumCollector({ onSeal: (group) => this.#deliverAlbum(group) });
   }
@@ -204,11 +234,92 @@ export class BridgeRuntime {
   /**
    * Closes every album still collecting and waits for the prompts they start.
    *
-   * Shutdown calls this: the quiet window is a guess about the user, and
+   * `shutdown` seals the same way, except that it does not await the seal
+   * before its deadline starts: the quiet window is a guess about the user, and
    * waiting it out would either delay the exit or lose the input.
    */
   async sealAlbums(): Promise<void> {
     await this.#albums.sealAll();
+  }
+
+  /**
+   * Stops the bridge without losing work and without finishing it silently.
+   *
+   * The order is the contract:
+   *
+   *   1. Abort polling, so Telegram is asked for nothing more.
+   *   2. Stop admitting updates. An update that arrives after this point gets
+   *      no processing record and is never settled, so the next process polls
+   *      it again from the unchanged checkpoint.
+   *   3. Seal every open album at once. Its quiet window is a guess about the
+   *      user, and waiting it out would either delay the exit or drop input.
+   *   4. Wait out the work already admitted — updates, downloads, and sends —
+   *      for at most `deadlineMs`.
+   *   5. Close the Backend, then the Store, in that order: an event arriving
+   *      after the database is gone would have nowhere to resolve its link.
+   *
+   * Work still running at the deadline keeps its processing record. Startup
+   * recovery turns that record into a dead letter and asks the topic to resend,
+   * which is the only honest outcome for an effect the bridge cannot prove.
+   * That is also why the runtime's own Telegram calls are cancelled only after
+   * the Store is closed: cancelling earlier would let a failing send reach its
+   * retry limit and retire the record it is supposed to leave open.
+   *
+   * Calling it twice returns the first outcome; the caller decides what a
+   * second signal means.
+   */
+  shutdown(options: ShutdownOptions = {}): Promise<ShutdownOutcome> {
+    this.#shutdown ??= this.#runShutdown(options);
+    return this.#shutdown;
+  }
+
+  async #runShutdown(options: ShutdownOptions): Promise<ShutdownOutcome> {
+    const deadlineMs = options.deadlineMs ?? SHUTDOWN_DEADLINE_MS;
+    this.#logger.info("bridge.shutdown.started", {
+      ...(options.reason === undefined ? {} : { reason: options.reason }),
+      delayMs: deadlineMs,
+    });
+    this.#polling?.abort();
+    this.#accepting = false;
+    const sealed = this.#albums.sealAll();
+    const drained = await this.#drainWork(sealed, deadlineMs);
+    if (!drained) {
+      // Named, not counted: the records left open are what startup recovery
+      // reads, and it reports them one by one with their thread.
+      this.#logger.error("bridge.shutdown.timeout", { delayMs: deadlineMs });
+    }
+    for (const sessionId of [...this.#streams.keys()]) this.#closeStream(sessionId);
+    await this.#backend.close();
+    this.#store.close();
+    this.#work.abort();
+    this.#logger.info("bridge.shutdown.finished", { reason: drained ? "drained" : "deadline" });
+    return { drained };
+  }
+
+  /**
+   * Waits for admitted work to stop, or for the deadline.
+   *
+   * Sealing an album queues a prompt, and a backend event can start a render
+   * while the scheduler is emptying, so this loops until both are quiet rather
+   * than taking one snapshot.
+   */
+  async #drainWork(sealed: Promise<void>, deadlineMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const expired = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), deadlineMs);
+    });
+    const quiet = (async () => {
+      await sealed;
+      while (this.#scheduler.size > 0 || this.#renders.size > 0) {
+        await Promise.all<unknown>([this.#scheduler.drain(), ...this.#renders]);
+      }
+      return true;
+    })();
+    try {
+      return await Promise.race([quiet, expired]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -272,6 +383,17 @@ export class BridgeRuntime {
     if (!isPrivateTopic(update.thread)) {
       this.#logger.debug("bridge.update.dropped", { updateId: update.updateId, reason: "not-topic" });
       this.#store.settleUpdates([update.updateId]);
+      return;
+    }
+    if (!this.#accepting) {
+      // Deliberately neither recorded nor settled: with no processing record
+      // the checkpoint stays where it was, so the next process polls this
+      // update again instead of recovering a unit that never started.
+      this.#logger.info("bridge.update.rejected", {
+        updateId: update.updateId,
+        threadId: update.thread.threadId,
+        reason: "shutting-down",
+      });
       return;
     }
     const unit: ProcessingUnit = {
@@ -495,18 +617,24 @@ export class BridgeRuntime {
       this.#logger.info("bridge.event.dropped", { sessionId: event.sessionId, reason: event.type });
       return;
     }
-    try {
-      await this.#render(event, link);
-    } catch (error) {
-      // The backend adapter swallows a failing handler, so a failure that got
-      // this far is reported here or nowhere.
-      this.#logger.error("bridge.event.failed", {
-        sessionId: event.sessionId,
-        threadId: link.threadId,
-        reason: event.type,
-        errorSummary: error instanceof Error ? error.message : undefined,
+    // Tracked, because a render is send work the scheduler never sees: it
+    // starts from a backend event, and shutdown has to wait for it too.
+    const render: Promise<void> = this.#render(event, link)
+      .catch((error: unknown) => {
+        // The backend adapter swallows a failing handler, so a failure that
+        // got this far is reported here or nowhere.
+        this.#logger.error("bridge.event.failed", {
+          sessionId: event.sessionId,
+          threadId: link.threadId,
+          reason: event.type,
+          errorSummary: error instanceof Error ? error.message : undefined,
+        });
+      })
+      .finally(() => {
+        this.#renders.delete(render);
       });
-    }
+    this.#renders.add(render);
+    await render;
   }
 
   async #render(event: BackendEvent, link: Link): Promise<void> {
@@ -620,7 +748,7 @@ export class BridgeRuntime {
       draftId: this.#drafts,
       sessionId: link.sessionId,
       logger: this.#logger,
-      ...(this.#signal === undefined ? {} : { signal: this.#signal }),
+      signal: this.#signal,
     });
     this.#streams.set(link.sessionId, stream);
     return stream;

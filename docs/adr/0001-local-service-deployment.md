@@ -5,9 +5,9 @@ Date: 2026-08-24
 Status: accepted, partially implemented
 
 Implementation status: `scripts/setup-dsh.sh` implements the dsh installation,
-credential validation, LaunchAgent, and bounded logging decisions. The bridge
-env installer and bridge LaunchAgent remain pending until the bridge event loop
-exists.
+credential validation, LaunchAgent, and bounded logging decisions.
+`scripts/setup-bridge.sh` implements the bridge configuration, validation, and
+LaunchAgent decisions as amended on 2026-08-25 below.
 
 ## Context
 
@@ -108,6 +108,24 @@ Strict startup validation converts a silent misconfiguration into an immediate,
 named failure. Hot reload would add file-watching state to the one component
 whose failure mode is unauthorised shell access.
 
+#### Amendment 2026-08-25: the env file is superseded by a JSON config
+
+ADR 0003 replaces the env-format `~/.config/im-bridge/env` with a single
+JSON document at `~/.config/im-bridge/config.json`, still mode 600 and still
+owned by the invoking user. The implemented loader is `src/config.ts`.
+
+The env format was chosen when the bridge needed two values. It now needs six,
+two of them structured: the numeric allowlist and the alias-to-directory map. An
+env file expresses those only as a delimiter convention that both the writer and
+the reader have to agree on out of band, and a stray exported variable of the
+same name would silently widen the allowlist. One document, parsed by one
+loader, removes both problems.
+
+Everything else in this section stands: the token is read with terminal echo
+disabled by `scripts/setup-bridge.sh`, never reaches a command line or a shell
+history, the file is validated at startup by the same loader the service uses,
+and rotation still means editing the file and restarting the bridge.
+
 ### Logging
 
 Each service writes to its own fixed log file, capped at 10 MB per file with 5
@@ -116,12 +134,31 @@ files retained.
 Rationale: enough history to diagnose a fault from the previous day, with a
 bounded disk cost that needs no attention.
 
+#### Amendment 2026-08-25: the bridge rotates at setup, not continuously
+
+dsh runs behind a supervisor process that owns its log file and rotates it while
+the service runs. The bridge has no supervisor: its LaunchAgent runs the pinned
+Node with the config path and nothing else, so that the only argument the
+service takes is the one file that is reviewable. Its stdout and stderr are
+redirected by launchd to `~/Library/Logs/im-bridge/bridge.log`, and
+`scripts/setup-bridge.sh` applies the same 10 MB by 5 files bookkeeping before
+each install.
+
+Consequence: one uninterrupted run of the bridge can grow its log past 10 MB,
+and it is trimmed at the next setup run rather than in place. Revisit this if a
+long-running bridge is measured producing enough output to matter; the fix is a
+log path the bridge itself owns, which needs a config field.
+
 ### Repository artifacts
 
 The repository holds credential-free templates and setup scripts. LaunchAgent
 property lists and env files are generated into the user's home directory at
 setup time and are never committed. The dsh path is implemented now; the bridge
 path follows when its event loop is implemented.
+
+Amendment 2026-08-25: both paths are implemented. `scripts/setup-bridge.sh`
+generates the bridge configuration and LaunchAgent, and the bridge LaunchAgent
+runs this checkout directly rather than a copied tree.
 
 ## Consequences
 

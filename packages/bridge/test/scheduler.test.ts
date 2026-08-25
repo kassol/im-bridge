@@ -115,4 +115,34 @@ describe("ThreadScheduler", () => {
     expect(ran).toBe(true);
     expect(scheduler.size).toBe(0);
   });
+
+  it("drains only once every lane is empty", async () => {
+    const scheduler = new ThreadScheduler();
+    const first = gate();
+    const second = gate();
+    const running = scheduler.run("thread-1", () => first.wait);
+    const queued = scheduler.run("thread-1", () => second.wait);
+
+    let drained = false;
+    const drain = scheduler.drain().then(() => {
+      drained = true;
+    });
+    await settle();
+    expect(drained).toBe(false);
+
+    first.open();
+    await running;
+    await settle();
+    // The lane still holds the queued task, so the scheduler is not idle.
+    expect(drained).toBe(false);
+
+    second.open();
+    await queued;
+    await drain;
+    expect(scheduler.size).toBe(0);
+  });
+
+  it("drains immediately when nothing was ever scheduled", async () => {
+    await expect(new ThreadScheduler().drain()).resolves.toBeUndefined();
+  });
 });

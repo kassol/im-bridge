@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --experimental-strip-types --watch src/index.ts",
     "start": "node --experimental-strip-types src/index.ts",
+    "live:e2e": "node --experimental-strip-types live/e2e.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
