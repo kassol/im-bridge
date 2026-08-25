@@ -45,6 +45,8 @@ pi 没有会话列表接口，也无法定向订阅某个会话的事件。给 p
 - pnpm workspace（`packages/*`）
 - SQLite：`node:sqlite`（Node 24 内置，无三方依赖）
 - Telegram：直接打 Bot API HTTP 接口，不引 SDK
+- Markdown 分片：`marked@18`（精确锁版，唯一运行时依赖）。只用 `lexer()` 的 block token：
+  `raw` 逐字保留原文，代码 token 带 `lang`，所以分片是按 token 边界拼接原文，不重新渲染
 - 测试：vitest
 
 不引 telegraf / grammy 这类框架。本项目只用到 Bot API 的极小子集，
@@ -55,8 +57,10 @@ pi 没有会话列表接口，也无法定向订阅某个会话的事件。给 p
 ```
 packages/bridge/src/
   backends/        backend adapter。每个 backend 实现同一个接口
-  telegram/        Telegram 平台适配：收 update、发消息、渲染
-  runtime/         update 编排：私聊 topic 管理菜单、callback 校验、link 变更
+  telegram/        Telegram 平台适配：收 update、发消息、渲染、
+                   Rich Message 预算与 Markdown 分片
+  runtime/         update 编排：私聊 topic 管理菜单、callback 校验、link 变更、
+                   turn 编排与流式草稿
   store/           SQLite schema v2：link 表、polling checkpoint、
                    update processing 记录、dead letter
 docs/              实测结论与协议记录
@@ -238,6 +242,17 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：打通文字 turn。linked topic 里的文字：空闲 session 走 `sendPrompt`
+  且不发任何开始消息，运行中的 session 走 `steer` 并回一句中文确认；运行状态在
+  `BridgeRuntime.start()` 由 `listSessions().running` 初始化，dsh Web UI 起的回合
+  同样渲染。每个 backend event 在到达时用当前 link 定位 thread，未绑定就记日志丢弃
+  （approval 留给审批 ticket，只记日志）。新增 `src/runtime/turns.ts`：首个 thinking /
+  output delta 建 `sendRichMessageDraft` 草稿，沿用 `StreamThrottle` 的 1 秒节奏并按
+  `retry_after` 退避，草稿含最新 2000 字思考 + 30000 UTF-8 字符预算内的解析输出，
+  截断时显式标注省略。最终结果只认 `turn-end.text`，用 `sendRichMessage` 的 markdown
+  入口落地，超过 32000 UTF-8 字符时按 `marked@18` 的 block token 分片
+  （`src/telegram/markdown.ts`，超长代码块按行拆并重建安全围栏与语言，多片带 `[N/M]`）；
+  中途失败即停，只报「已发送 k/M」，不重发也不重跑 backend。新增 22 项单测。
 - 2026-08-25：落地私聊 topic 管理路径。新增 `src/runtime/`：`runtime.ts`
   （`BridgeRuntime.handleUpdate` 作为 update 唯一入口，`/start` 说明入口、
   `/manage` 按 unlinked / linked / invalid-link 出对应菜单、未绑定 topic 的消息丢弃正文

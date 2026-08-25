@@ -57,6 +57,10 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
 
+  // Subscribing before polling means a turn already running in dsh's own Web UI
+  // renders from its next event, not from the next Telegram message.
+  await runtime.start();
+
   try {
     await runUpdateLoop({
       api,

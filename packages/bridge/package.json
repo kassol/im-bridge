@@ -13,5 +13,8 @@
     "@types/node": "^24.0.0",
     "typescript": "^5.7.2",
     "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "marked": "18.0.10"
   }
 }

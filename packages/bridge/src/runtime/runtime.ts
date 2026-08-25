@@ -17,15 +17,19 @@
  *     `Store.link` refuses an occupied side, an active session refuses an
  *     unlink, and unlinking leaves the backend session alone.
  *
- * Text in a linked topic becomes a prompt in a later ticket; here it is logged.
+ * Text in a linked topic is a prompt. An idle session starts a turn, a running
+ * one is steered, and the backend's events come back through the link that
+ * exists when each event arrives — never through the one the turn started with.
  */
-import type { Backend, Session } from "../backends/types.ts";
+import type { Backend, BackendEvent, PromptContent, Session } from "../backends/types.ts";
 import type { Logger } from "../log.ts";
 import { LinkConflictError, type Link, type Store } from "../store/store.ts";
 import type { Allowlist } from "../telegram/allowlist.ts";
-import type { TelegramApi } from "../telegram/api.ts";
+import { TelegramApiError, type TelegramApi } from "../telegram/api.ts";
+import { headChars, splitFinalMarkdown } from "../telegram/markdown.ts";
 import type { InboundCallback, InboundMessage, InboundUpdate, ThreadIdentity } from "../telegram/updates.ts";
 import { createEpoch, decodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
+import { TurnStream } from "./turns.ts";
 import {
   existingSessionsMenu,
   expiredMenu,
@@ -45,6 +49,9 @@ import {
 /** The one platform this bridge speaks, as stored in the link table. */
 export const PLATFORM = "telegram";
 
+/** A backend message is quoted in a status line, not reproduced whole. */
+const NOTICE_LIMIT = 500;
+
 export const ALREADY_LINKED_NOTICE = "本 topic 已绑定 session，请先解除绑定。";
 export const THREAD_CONFLICT_NOTICE = "本 topic 已绑定其他 session，两边绑定都未改动。";
 export const SESSION_CONFLICT_NOTICE = "该 session 已绑定到其他 topic，两边绑定都未改动。";
@@ -53,6 +60,14 @@ export const AMBIGUOUS_SESSION_NOTICE = "有多个 session 的编号结尾相同
 export const ALIAS_GONE_NOTICE = "该工作目录已不在配置中。";
 export const RUNNING_NOTICE = "session 正在运行，无法解除绑定。";
 export const UNLINKED_NOTICE = "已解除绑定，backend session 未删除。";
+export const STEER_ACK_TEXT = "已插入当前回合。";
+export const WARNING_PREFIX = "后端警告：";
+export const ERROR_PREFIX = "后端错误：";
+
+/** Says how much of a split result reached Telegram. Nothing is resent. */
+export function partialResultText(sent: number, total: number): string {
+  return `发送失败：已发送 ${sent}/${total}，其余未发送。`;
+}
 
 export interface BridgeRuntimeOptions {
   api: TelegramApi;
@@ -85,6 +100,12 @@ export class BridgeRuntime {
   readonly #cwdAliases: ReadonlyMap<string, string>;
   readonly #logger: Logger;
   readonly #signal: AbortSignal | undefined;
+  /** Sessions mid-turn. Seeded from the backend, not from what the bridge sent. */
+  readonly #active = new Set<string>();
+  /** The live draft of each session that is streaming. */
+  readonly #streams = new Map<string, TurnStream>();
+  /** Telegram rejects a zero draft id, so the first turn gets 1. */
+  #drafts = 0;
 
   constructor(options: BridgeRuntimeOptions) {
     this.#api = options.api;
@@ -95,6 +116,20 @@ export class BridgeRuntime {
     this.#logger = options.logger;
     this.#signal = options.signal;
     this.epoch = options.epoch ?? createEpoch();
+  }
+
+  /**
+   * Subscribes to the backend and records which linked sessions are mid-turn.
+   *
+   * Running state comes from the backend because a turn may have been started
+   * in dsh's own Web UI, before this process existed. Text arriving for such a
+   * session must steer it, not queue a second prompt behind it.
+   */
+  async start(): Promise<void> {
+    for (const session of await this.#backend.listSessions()) {
+      if (session.running) this.#active.add(session.sessionId);
+    }
+    this.#backend.subscribe((event) => this.#onEvent(event));
   }
 
   /**
@@ -132,12 +167,9 @@ export class BridgeRuntime {
       await this.#send(update.thread, unknownCommandMenu(this.epoch));
       return;
     }
-    if (this.#linkOf(update.thread) !== undefined) {
-      // Turning a message into a prompt belongs to the turn runtime.
-      this.#logger.debug("bridge.message.linked", {
-        updateId: update.updateId,
-        threadId: update.thread.threadId,
-      });
+    const link = this.#linkOf(update.thread);
+    if (link !== undefined) {
+      await this.#deliverPrompt(update, link);
       return;
     }
     // The body is dropped rather than queued: it was written for a session that
@@ -148,6 +180,184 @@ export class BridgeRuntime {
       threadId: update.thread.threadId,
     });
     await this.#send(update.thread, unlinkedMenu(this.epoch, MESSAGE_DISCARDED_TEXT));
+  }
+
+  /**
+   * Text in a linked topic is the prompt.
+   *
+   * An idle session starts a turn and says nothing: the draft is the feedback,
+   * and a separate "started" message would only push it out of view. A running
+   * session is steered instead, because a second prompt would queue behind the
+   * work the user is trying to redirect, and steering is confirmed because
+   * nothing else marks it as accepted.
+   */
+  async #deliverPrompt(update: InboundMessage, link: Link): Promise<void> {
+    if (update.text === undefined) {
+      // Images are their own ticket; this path carries text only.
+      this.#logger.info("bridge.prompt.unsupported", {
+        updateId: update.updateId,
+        threadId: update.thread.threadId,
+      });
+      return;
+    }
+    const content: PromptContent = [{ type: "text", text: update.text }];
+    if (this.#active.has(link.sessionId)) {
+      await this.#backend.steer(link.sessionId, content);
+      this.#logger.info("bridge.turn.steered", {
+        threadId: update.thread.threadId,
+        sessionId: link.sessionId,
+      });
+      await this.#notify(update.thread, STEER_ACK_TEXT);
+      return;
+    }
+    await this.#backend.sendPrompt(link.sessionId, content);
+    this.#active.add(link.sessionId);
+    this.#logger.info("bridge.turn.started", {
+      threadId: update.thread.threadId,
+      sessionId: link.sessionId,
+    });
+  }
+
+  /**
+   * One backend event.
+   *
+   * Running state is updated first: it describes the session, not the topic,
+   * so it stays correct even for a session no thread holds. The destination is
+   * then resolved through the link
+   * as it stands right now: a topic may have been unlinked or rebound while the
+   * session was working, and output must never land where it no longer belongs.
+   */
+  async #onEvent(event: BackendEvent): Promise<void> {
+    if (event.type === "turn-end" || event.type === "error") this.#active.delete(event.sessionId);
+    if (event.type === "output" || event.type === "thinking") this.#active.add(event.sessionId);
+    const link = this.#store.findBySession(this.#backend.name, event.sessionId);
+    if (link === undefined) {
+      this.#closeStream(event.sessionId);
+      this.#logger.info("bridge.event.dropped", { sessionId: event.sessionId, reason: event.type });
+      return;
+    }
+    try {
+      await this.#render(event, link);
+    } catch (error) {
+      // The backend adapter swallows a failing handler, so a failure that got
+      // this far is reported here or nowhere.
+      this.#logger.error("bridge.event.failed", {
+        sessionId: event.sessionId,
+        threadId: link.threadId,
+        reason: event.type,
+        errorSummary: error instanceof Error ? error.message : undefined,
+      });
+    }
+  }
+
+  async #render(event: BackendEvent, link: Link): Promise<void> {
+    const thread: ThreadIdentity = { chatId: link.chatId, threadId: link.threadId };
+    switch (event.type) {
+      case "thinking":
+        this.#streamFor(link).pushThinking(event.text);
+        return;
+      case "output":
+        this.#streamFor(link).pushOutput(event.text);
+        return;
+      case "warning":
+        await this.#notify(thread, `${WARNING_PREFIX}${headChars(event.message, NOTICE_LIMIT)}`);
+        return;
+      case "error":
+        this.#closeStream(event.sessionId);
+        await this.#notify(thread, `${ERROR_PREFIX}${headChars(event.message, NOTICE_LIMIT)}`);
+        return;
+      case "turn-end":
+        this.#closeStream(event.sessionId);
+        await this.#deliverResult(thread, event.text);
+        return;
+      case "approval":
+        // The approval UI is its own ticket. Until then the request stays
+        // pending for another dsh client rather than being answered here.
+        this.#logger.info("bridge.approval.ignored", { sessionId: event.sessionId });
+        return;
+    }
+  }
+
+  /**
+   * Persists the result of a turn.
+   *
+   * `turn-end.text` is the only source read here: the draft accumulated a
+   * preview that Telegram pacing and backend buffering are both allowed to
+   * thin out, so reading it back could publish a shortened answer. A failed
+   * part stops the sequence, because resending would duplicate whatever
+   * already reached Telegram, and the backend turn is never repeated.
+   */
+  async #deliverResult(thread: ThreadIdentity, text: string): Promise<void> {
+    if (text.trim() === "") {
+      this.#logger.info("bridge.result.empty", { threadId: thread.threadId });
+      return;
+    }
+    const parts = splitFinalMarkdown(text);
+    for (const [index, part] of parts.entries()) {
+      try {
+        await this.#api.sendRichMessage({
+          chatId: thread.chatId,
+          threadId: thread.threadId,
+          markdown: part,
+          signal: this.#signal,
+        });
+      } catch (error) {
+        this.#logger.error("bridge.result.failed", {
+          threadId: thread.threadId,
+          count: index,
+          errorCode: error instanceof TelegramApiError ? error.errorCode : undefined,
+          errorSummary: error instanceof TelegramApiError ? error.description : undefined,
+        });
+        await this.#notify(thread, partialResultText(index, parts.length));
+        return;
+      }
+    }
+    this.#logger.info("bridge.result.sent", { threadId: thread.threadId, count: parts.length });
+  }
+
+  /** The draft of this session, moved to the topic the link names today. */
+  #streamFor(link: Link): TurnStream {
+    const existing = this.#streams.get(link.sessionId);
+    if (existing !== undefined) {
+      if (existing.chatId === link.chatId && existing.threadId === link.threadId) return existing;
+      // The topic changed under the turn; that draft has nowhere left to land.
+      existing.close();
+    }
+    this.#drafts += 1;
+    const stream = new TurnStream({
+      api: this.#api,
+      chatId: link.chatId,
+      threadId: link.threadId,
+      draftId: this.#drafts,
+      sessionId: link.sessionId,
+      logger: this.#logger,
+      ...(this.#signal === undefined ? {} : { signal: this.#signal }),
+    });
+    this.#streams.set(link.sessionId, stream);
+    return stream;
+  }
+
+  #closeStream(sessionId: string): void {
+    this.#streams.get(sessionId)?.close();
+    this.#streams.delete(sessionId);
+  }
+
+  /** A short status line. Failing to deliver it must not fail the event. */
+  async #notify(thread: ThreadIdentity, text: string): Promise<void> {
+    try {
+      await this.#api.sendMessage({
+        chatId: thread.chatId,
+        threadId: thread.threadId,
+        text,
+        signal: this.#signal,
+      });
+    } catch (error) {
+      this.#logger.error("bridge.notice.failed", {
+        threadId: thread.threadId,
+        errorCode: error instanceof TelegramApiError ? error.errorCode : undefined,
+        errorSummary: error instanceof TelegramApiError ? error.description : undefined,
+      });
+    }
   }
 
   async #handleCallback(update: InboundCallback): Promise<void> {

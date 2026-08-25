@@ -55,6 +55,19 @@ export interface InlineKeyboardButton {
 /** Rows of inline buttons. An empty keyboard leaves a message with no buttons. */
 export type InlineKeyboard = readonly (readonly InlineKeyboardButton[])[];
 
+/**
+ * One block of a Rich Message.
+ *
+ * Only the three shapes the bridge renders are modelled. `language` is what
+ * makes Telegram highlight code — measured 2026-08-24, a `pre` block without
+ * it renders with zero coloured spans — so the language travels with the code
+ * instead of being dropped at this boundary.
+ */
+export type RichBlock =
+  | { readonly type: "thinking"; readonly text: string }
+  | { readonly type: "paragraph"; readonly text: string }
+  | { readonly type: "pre"; readonly text: string; readonly language?: string };
+
 /** A Telegram update, still in wire shape. Wire types stay inside this directory. */
 export interface TelegramUpdate {
   readonly update_id: number;
@@ -175,6 +188,60 @@ export class TelegramApi {
     });
     if (!isRecord(result) || typeof result.message_id !== "number") {
       throw new TelegramApiError({ method: "sendMessage", kind: "malformed", transient: false });
+    }
+    return result.message_id;
+  }
+
+  /**
+   * Replaces the streaming preview of a turn.
+   *
+   * A draft is a 30-second preview that never enters history, and the same
+   * `draft_id` supersedes the previous one, so a repeat changes nothing the
+   * user can see. It does not retry: drafts are paced by `StreamThrottle`, and
+   * the next flush carries fresher blocks than a retry of this one would, so
+   * sleeping inside the call would only delay newer content.
+   */
+  async sendRichMessageDraft(draft: {
+    chatId: number;
+    threadId?: number;
+    /** Telegram rejects a zero id; the caller numbers drafts per turn. */
+    draftId: number;
+    blocks: readonly RichBlock[];
+    signal?: AbortSignal;
+  }): Promise<void> {
+    const payload: Record<string, unknown> = { chat_id: draft.chatId };
+    if (draft.threadId !== undefined) payload.message_thread_id = draft.threadId;
+    payload.draft_id = draft.draftId;
+    payload.rich_message = { blocks: draft.blocks.map(toRichBlock) };
+    await this.call("sendRichMessageDraft", payload, {
+      retryClass: "idempotent",
+      maxRetries: 0,
+      signal: draft.signal,
+    });
+  }
+
+  /**
+   * Sends the result that stays in history, and returns its message id.
+   *
+   * Markdown is the entry point rather than blocks: measured 2026-08-24, the
+   * two render identically, and Markdown keeps the agent's own output shape
+   * without a block tree built from it.
+   */
+  async sendRichMessage(message: {
+    chatId: number;
+    threadId?: number;
+    markdown: string;
+    signal?: AbortSignal;
+  }): Promise<number> {
+    const payload: Record<string, unknown> = { chat_id: message.chatId };
+    if (message.threadId !== undefined) payload.message_thread_id = message.threadId;
+    payload.rich_message = { markdown: message.markdown };
+    const result = await this.call("sendRichMessage", payload, {
+      retryClass: "final-send",
+      signal: message.signal,
+    });
+    if (!isRecord(result) || typeof result.message_id !== "number") {
+      throw new TelegramApiError({ method: "sendRichMessage", kind: "malformed", transient: false });
     }
     return result.message_id;
   }
@@ -383,6 +450,18 @@ function toReplyMarkup(keyboard: InlineKeyboard): Record<string, unknown> {
       row.map((button) => ({ text: button.text, callback_data: button.callbackData })),
     ),
   };
+}
+
+/** Wire shape of one Rich Message block. Telegram field names stop here. */
+function toRichBlock(block: RichBlock): Record<string, unknown> {
+  if (block.type === "pre") {
+    return {
+      type: "pre",
+      text: block.text,
+      ...(block.language === undefined ? {} : { language: block.language }),
+    };
+  }
+  return { type: block.type, text: block.text };
 }
 
 /** "message is not modified" reports that the edit was already applied. */

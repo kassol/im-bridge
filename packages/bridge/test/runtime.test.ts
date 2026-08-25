@@ -212,12 +212,15 @@ describe("commands", () => {
     expect(backend.prompts).toHaveLength(0);
   });
 
-  it("leaves text in a linked topic to the turn runtime", async () => {
+  it("turns text in a linked topic into a prompt and answers nothing", async () => {
     await start([session("01j8z4qk9m7f3b2n6x5c4v-0001")]);
     store.link({ platform: PLATFORM, chatId: CHAT, threadId: THREAD, backend: "dsh", sessionId: "01j8z4qk9m7f3b2n6x5c4v-0001" });
     await runtime.handleUpdate(message({ text: "写个测试" }));
+    expect(backend.prompts).toEqual([
+      { kind: "prompt", sessionId: "01j8z4qk9m7f3b2n6x5c4v-0001", content: [{ type: "text", text: "写个测试" }] },
+    ]);
+    // A normal turn adds no start message; the draft is the feedback.
     expect(server.calls).toHaveLength(0);
-    expect(backend.prompts).toHaveLength(0);
   });
 });
 
