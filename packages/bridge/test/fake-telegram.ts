@@ -23,6 +23,24 @@ export interface FakeReply {
   raw?: string;
   /** Never answer, so the client hits its own timeout. */
   hang?: true;
+  /** A complete file body, sent with its real Content-Length. */
+  bytes?: Uint8Array;
+  /** A file body written chunk by chunk, so a client can stop mid-body. */
+  stream?: FakeStream;
+}
+
+/**
+ * A file body the client has to read to the end to receive whole.
+ *
+ * `contentLength` is omitted by default, which makes Node use chunked transfer
+ * encoding and advertise no length at all — the case a client must survive
+ * without trusting a header. `onWrote` reports how much actually reached the
+ * socket, so a test can prove the client stopped reading early.
+ */
+export interface FakeStream {
+  readonly chunks: readonly Uint8Array[];
+  readonly contentLength?: number;
+  readonly onWrote?: (written: number) => void;
 }
 
 export interface FakeTelegram {
@@ -30,6 +48,43 @@ export interface FakeTelegram {
   readonly calls: FakeCall[];
   methods(): string[];
   close(): Promise<void>;
+}
+
+/**
+ * Writes a body one chunk at a time, honouring backpressure so the socket
+ * carries the chunks separately, and stops as soon as the client goes away.
+ */
+async function writeStream(response: ServerResponse, stream: FakeStream, status: number): Promise<void> {
+  // A client that aborts mid-body makes the socket emit an error; it is the
+  // expected end of this response, not a test failure.
+  response.on("error", () => void 0);
+  response.statusCode = status;
+  response.setHeader("content-type", "application/octet-stream");
+  if (stream.contentLength !== undefined) response.setHeader("content-length", String(stream.contentLength));
+  let written = 0;
+  for (const chunk of stream.chunks) {
+    if (response.destroyed || response.writableEnded) break;
+    const flushed = response.write(Buffer.from(chunk));
+    written += 1;
+    stream.onWrote?.(written);
+    if (!flushed) await drained(response);
+  }
+  if (!response.destroyed && !response.writableEnded) response.end();
+}
+
+/** Resolves when the socket accepts more, or when it is gone. */
+function drained(response: ServerResponse): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      response.off("drain", done);
+      response.off("close", done);
+      response.off("error", done);
+      resolve();
+    };
+    response.once("drain", done);
+    response.once("close", done);
+    response.once("error", done);
+  });
 }
 
 export async function startFakeTelegram(
@@ -60,6 +115,16 @@ export async function startFakeTelegram(
         open.add(response);
         return;
       }
+      if (reply.bytes !== undefined) {
+        response.statusCode = reply.status ?? 200;
+        response.setHeader("content-type", "application/octet-stream");
+        response.end(Buffer.from(reply.bytes));
+        return;
+      }
+      if (reply.stream !== undefined) {
+        await writeStream(response, reply.stream, reply.status ?? 200);
+        return;
+      }
       response.statusCode = reply.status ?? 200;
       response.setHeader("content-type", "application/json");
       response.end(reply.raw ?? JSON.stringify(reply.json ?? { ok: true, result: true }));
@@ -75,6 +140,9 @@ export async function startFakeTelegram(
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const response of open) response.destroy();
+        // An aborted download leaves its socket behind, and `close` waits for
+        // every one of them; the test is over, so they go now.
+        server.closeAllConnections();
         server.close((error) => (error ? reject(error) : resolve()));
       }),
   };

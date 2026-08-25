@@ -38,6 +38,8 @@ export interface LogFields {
   readonly sessionId?: string;
   readonly botId?: number;
   readonly count?: number;
+  /** How many images one prompt carried. A count, never the images. */
+  readonly imageCount?: number;
 }
 
 export interface Logger {

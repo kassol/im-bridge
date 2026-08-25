@@ -28,6 +28,8 @@ export interface TelegramApiOptions {
   token: string;
   /** Defaults to the public Bot API host. */
   baseUrl?: string;
+  /** Where `/file/bot<token>/<path>` is served. Defaults to `baseUrl`. */
+  fileBaseUrl?: string;
   logger?: Logger;
   /** Injected so tests do not wait out backoff. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -108,6 +110,23 @@ export class TelegramApiError extends Error {
   }
 }
 
+/**
+ * A download that passed its byte ceiling.
+ *
+ * It is separate from `TelegramApiError` because it is not a failure of the
+ * transport and repeating it would download the same oversized file again:
+ * the caller has to reject the file, not retry it.
+ */
+export class TelegramFileTooLargeError extends Error {
+  readonly limitBytes: number;
+
+  constructor(limitBytes: number) {
+    super(`Telegram file exceeds ${limitBytes} bytes`);
+    this.name = "TelegramFileTooLargeError";
+    this.limitBytes = limitBytes;
+  }
+}
+
 const DEFAULT_BASE_URL = "https://api.telegram.org";
 /** Telegram holds a long poll this long before answering with an empty list. */
 const POLL_TIMEOUT_SECONDS = 50;
@@ -122,12 +141,14 @@ const MAX_DESCRIPTION_LENGTH = 200;
 export class TelegramApi {
   readonly #token: string;
   readonly #baseUrl: string;
+  readonly #fileBaseUrl: string;
   readonly #logger: Logger | undefined;
   readonly #sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
 
   constructor(options: TelegramApiOptions) {
     this.#token = options.token;
     this.#baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+    this.#fileBaseUrl = options.fileBaseUrl ?? this.#baseUrl;
     this.#logger = options.logger;
     this.#sleep = options.sleep ?? delay;
   }
@@ -168,6 +189,102 @@ export class TelegramApi {
       throw new TelegramApiError({ method: "getUpdates", kind: "malformed", transient: true });
     }
     return result.filter(isUpdate);
+  }
+
+  /**
+   * Resolves a file id to the path the file endpoint serves.
+   *
+   * Reading file metadata changes nothing, so this is an idempotent read and
+   * the shared retry policy applies to it unchanged.
+   */
+  async getFile(fileId: string, signal?: AbortSignal): Promise<string> {
+    const result = await this.call("getFile", { file_id: fileId }, { retryClass: "idempotent", signal });
+    if (!isRecord(result) || typeof result.file_path !== "string") {
+      throw new TelegramApiError({ method: "getFile", kind: "malformed", transient: false });
+    }
+    return result.file_path;
+  }
+
+  /**
+   * Downloads a file into memory, refusing to hold more than `limitBytes`.
+   *
+   * The body is read chunk by chunk and the running total decides when to
+   * stop, because nothing about the response is trusted: `Content-Length` may
+   * be absent under chunked encoding, and Telegram's advertised `file_size`
+   * may be smaller than what actually arrives. The request is aborted the
+   * moment the total passes the ceiling, so the extra bytes are never held.
+   */
+  async downloadFile(file: { filePath: string; limitBytes: number; signal?: AbortSignal }): Promise<Uint8Array> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.#downloadAttempt(file);
+      } catch (error) {
+        if (file.signal?.aborted === true) throw error;
+        if (!(error instanceof TelegramApiError)) throw error;
+        const delayMs = retryDelayMs(error, "idempotent", attempt, MAX_RETRIES);
+        if (delayMs === undefined) {
+          this.#logger?.error("telegram.request.failed", {
+            method: "downloadFile",
+            attempt,
+            retryClass: "idempotent",
+            errorCode: error.errorCode,
+            errorSummary: error.description,
+          });
+          throw error;
+        }
+        this.#logger?.info("telegram.request.retry", {
+          method: "downloadFile",
+          attempt,
+          delayMs,
+          retryClass: "idempotent",
+          errorCode: error.errorCode,
+        });
+        await this.#sleep(delayMs, file.signal);
+      }
+    }
+  }
+
+  async #downloadAttempt(file: { filePath: string; limitBytes: number; signal?: AbortSignal }): Promise<Uint8Array> {
+    const controller = new AbortController();
+    const timeout = AbortSignal.timeout(CALL_TIMEOUT_MS);
+    const signals = [controller.signal, timeout];
+    if (file.signal !== undefined) signals.push(file.signal);
+    let response: Response;
+    try {
+      response = await fetch(`${this.#fileBaseUrl}/file/bot${this.#token}/${file.filePath}`, {
+        signal: AbortSignal.any(signals),
+      });
+    } catch (error) {
+      if (file.signal?.aborted === true) throw file.signal.reason;
+      // Summarised, not chained: a cause carries the request URL, and the URL
+      // contains the token.
+      throw new TelegramApiError({
+        method: "downloadFile",
+        kind: "transport",
+        transient: true,
+        description: this.#bound(summarize(error)),
+      });
+    }
+    if (!response.ok || response.body === null) {
+      throw new TelegramApiError({
+        method: "downloadFile",
+        kind: response.ok ? "malformed" : "api",
+        transient: response.status >= 500,
+        errorCode: response.status,
+      });
+    }
+    try {
+      return await readBounded(response.body, file.limitBytes, controller);
+    } catch (error) {
+      if (error instanceof TelegramFileTooLargeError) throw error;
+      if (file.signal?.aborted === true) throw file.signal.reason;
+      throw new TelegramApiError({
+        method: "downloadFile",
+        kind: "transport",
+        transient: true,
+        description: this.#bound(summarize(error)),
+      });
+    }
   }
 
   /** Sends a plain message and returns its message id. */
@@ -415,6 +532,38 @@ export class TelegramApi {
     const redacted = text.split(this.#token).join("<redacted>");
     return redacted.length <= MAX_DESCRIPTION_LENGTH ? redacted : redacted.slice(0, MAX_DESCRIPTION_LENGTH);
   }
+}
+
+/**
+ * Reads a body while counting bytes, and aborts the request as soon as the
+ * count passes the ceiling. The chunks already read are dropped with it, so a
+ * hostile or mistaken length never costs more than one chunk over the limit.
+ */
+async function readBounded(
+  body: ReadableStream<Uint8Array>,
+  limitBytes: number,
+  controller: AbortController,
+): Promise<Uint8Array> {
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done === true) break;
+    total += chunk.value.byteLength;
+    if (total > limitBytes) {
+      controller.abort();
+      throw new TelegramFileTooLargeError(limitBytes);
+    }
+    chunks.push(chunk.value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 /**

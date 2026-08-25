@@ -60,7 +60,7 @@ packages/bridge/src/
   telegram/        Telegram 平台适配：收 update、发消息、渲染、
                    Rich Message 预算与 Markdown 分片
   runtime/         update 编排：私聊 topic 管理菜单、callback 校验、link 变更、
-                   turn 编排与流式草稿
+                   turn 编排与流式草稿、图片与相册输入、图片内存预算
   store/           SQLite schema v2：link 表、polling checkpoint、
                    update processing 记录、dead letter
 docs/              实测结论与协议记录
@@ -242,6 +242,18 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：图片与相册进入 prompt 路径。linked topic 里的 Telegram photo 与
+  image document 走和文字同一条输入：photo 选不超过 5 MiB 的最大变体，document 校验
+  MIME（JPEG / PNG / WebP）并保留安全文件名，caption 作为 text 部分，无 caption 用固定
+  中文分析请求（`src/runtime/media.ts`）。一次最多 4 张；张数超限、类型不支持、体积超限、
+  下载失败各回一句中文，整条输入都不发给 backend。相册按 `media_group_id` 收集，静默
+  1 秒后按 message id 排序封口成一条 prompt，并带上全部 update id 作为同一处理单元
+  （`src/runtime/albums.ts`；`BridgeRuntime.sealAlbums()` 让关机立即封口，不等静默窗口）。
+  `telegram/api.ts` 新增 `getFile` 与 `downloadFile`：文件 base URL 可注入，边读边计数，
+  过 5 MiB 立即 abort，不信任 Content-Length 与 Telegram 声明的 `file_size`。
+  `src/runtime/semaphore.ts` 是全局加权信号量，20 MiB 且最多 4 个线程同时持有，
+  `finally` 在 `sendPrompt` / `steer` 成功或失败后释放。图片只在内存里，不进 SQLite、
+  日志、dead letter 或临时文件。新增 22 项单测。
 - 2026-08-25：打通文字 turn。linked topic 里的文字：空闲 session 走 `sendPrompt`
   且不发任何开始消息，运行中的 session 走 `steer` 并回一句中文确认；运行状态在
   `BridgeRuntime.start()` 由 `listSessions().running` 初始化，dsh Web UI 起的回合

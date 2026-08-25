@@ -20,6 +20,9 @@
  * Text in a linked topic is a prompt. An idle session starts a turn, a running
  * one is steered, and the backend's events come back through the link that
  * exists when each event arrives — never through the one the turn started with.
+ * Images take the same path: an album becomes one input once its members stop
+ * arriving, and its bytes are held only between the memory reservation and the
+ * backend call that consumes them.
  */
 import type { Backend, BackendEvent, PromptContent, Session } from "../backends/types.ts";
 import type { Logger } from "../log.ts";
@@ -28,7 +31,10 @@ import type { Allowlist } from "../telegram/allowlist.ts";
 import { TelegramApiError, type TelegramApi } from "../telegram/api.ts";
 import { headChars, splitFinalMarkdown } from "../telegram/markdown.ts";
 import type { InboundCallback, InboundMessage, InboundUpdate, ThreadIdentity } from "../telegram/updates.ts";
+import { AlbumCollector, type AlbumGroup } from "./albums.ts";
 import { createEpoch, decodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
+import { MediaError, downloadImages, mediaNotice, planPrompt, type PromptPlan } from "./media.ts";
+import { MemorySemaphore } from "./semaphore.ts";
 import { TurnStream } from "./turns.ts";
 import {
   existingSessionsMenu,
@@ -51,6 +57,11 @@ export const PLATFORM = "telegram";
 
 /** A backend message is quoted in a status line, not reproduced whole. */
 const NOTICE_LIMIT = 500;
+
+/** Every image buffer in the process, summed. */
+const IMAGE_BUDGET_BYTES = 20 * 1024 * 1024;
+/** How many threads may hold image budget at once. */
+const MAX_IMAGE_THREADS = 4;
 
 export const ALREADY_LINKED_NOTICE = "本 topic 已绑定 session，请先解除绑定。";
 export const THREAD_CONFLICT_NOTICE = "本 topic 已绑定其他 session，两边绑定都未改动。";
@@ -84,6 +95,16 @@ export interface BridgeRuntimeOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * One atomic input. `updateIds` is the processing unit: an album completes or
+ * fails as the whole set of updates that made it, never as one of them.
+ */
+interface PromptInput {
+  readonly thread: ThreadIdentity;
+  readonly updateIds: readonly number[];
+  readonly messages: readonly InboundMessage[];
+}
+
 /** What to show on the tapped button. An alert needs a tap to dismiss. */
 interface Notice {
   readonly text: string;
@@ -104,6 +125,13 @@ export class BridgeRuntime {
   readonly #active = new Set<string>();
   /** The live draft of each session that is streaming. */
   readonly #streams = new Map<string, TurnStream>();
+  /** Album members waiting for their group to go quiet. */
+  readonly #albums: AlbumCollector;
+  /** The one place image bytes are counted, across every thread. */
+  readonly #budget = new MemorySemaphore({
+    capacityBytes: IMAGE_BUDGET_BYTES,
+    maxHolders: MAX_IMAGE_THREADS,
+  });
   /** Telegram rejects a zero draft id, so the first turn gets 1. */
   #drafts = 0;
 
@@ -116,6 +144,17 @@ export class BridgeRuntime {
     this.#logger = options.logger;
     this.#signal = options.signal;
     this.epoch = options.epoch ?? createEpoch();
+    this.#albums = new AlbumCollector({ onSeal: (group) => this.#deliverAlbum(group) });
+  }
+
+  /**
+   * Closes every album still collecting and waits for the prompts they start.
+   *
+   * Shutdown calls this: the quiet window is a guess about the user, and
+   * waiting it out would either delay the exit or lose the input.
+   */
+  async sealAlbums(): Promise<void> {
+    await this.#albums.sealAll();
   }
 
   /**
@@ -183,7 +222,95 @@ export class BridgeRuntime {
   }
 
   /**
-   * Text in a linked topic is the prompt.
+   * A message in a linked topic is the prompt.
+   *
+   * An album is not delivered here: its members are separate updates, so it is
+   * collected until the group goes quiet and delivered as one input.
+   */
+  async #deliverPrompt(update: InboundMessage, link: Link): Promise<void> {
+    if (update.mediaGroupId !== undefined) {
+      this.#albums.add(update.mediaGroupId, update);
+      return;
+    }
+    await this.#deliverInput(
+      { thread: update.thread, updateIds: [update.updateId], messages: [update] },
+      link,
+    );
+  }
+
+  /**
+   * One complete album, resolved against the link it has now.
+   *
+   * The seal runs on a timer rather than inside `handleUpdate`, so nothing is
+   * left to report a failure: this is the last place that can, and it must not
+   * reject.
+   */
+  async #deliverAlbum(group: AlbumGroup): Promise<void> {
+    const link = this.#linkOf(group.thread);
+    if (link === undefined) {
+      // The topic was unlinked while the album was still arriving.
+      this.#logger.info("bridge.album.dropped", {
+        threadId: group.thread.threadId,
+        count: group.updateIds.length,
+      });
+      return;
+    }
+    try {
+      await this.#deliverInput(group, link);
+    } catch (error) {
+      this.#logger.error("bridge.prompt.failed", {
+        threadId: group.thread.threadId,
+        sessionId: link.sessionId,
+        count: group.updateIds.length,
+        errorSummary: error instanceof Error ? error.message : undefined,
+      });
+    }
+  }
+
+  /**
+   * One atomic input: a message, or a whole album.
+   *
+   * The plan is built before any byte is fetched, so an input that cannot work
+   * costs nothing and is reported once. Images are downloaded under a global
+   * memory reservation that is released only after the backend has taken the
+   * content — the buffers live exactly as long as the reservation says.
+   */
+  async #deliverInput(input: PromptInput, link: Link): Promise<void> {
+    let plan: PromptPlan;
+    try {
+      plan = planPrompt(input.messages);
+    } catch (error) {
+      await this.#reportMedia(input, error);
+      return;
+    }
+    if (plan.images.length === 0) {
+      if (plan.text === "") {
+        this.#logger.info("bridge.prompt.unsupported", {
+          updateId: input.updateIds[0],
+          threadId: input.thread.threadId,
+        });
+        return;
+      }
+      await this.#sendContent(input, link, [{ type: "text", text: plan.text }]);
+      return;
+    }
+    const release = await this.#budget.acquire(plan.weightBytes);
+    try {
+      let images: PromptContent;
+      try {
+        images = await downloadImages(this.#api, plan.images, this.#signal);
+      } catch (error) {
+        await this.#reportMedia(input, error);
+        return;
+      }
+      await this.#sendContent(input, link, [{ type: "text", text: plan.text }, ...images]);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Sends one input to the session this thread holds.
    *
    * An idle session starts a turn and says nothing: the draft is the feedback,
    * and a separate "started" message would only push it out of view. A running
@@ -191,31 +318,36 @@ export class BridgeRuntime {
    * work the user is trying to redirect, and steering is confirmed because
    * nothing else marks it as accepted.
    */
-  async #deliverPrompt(update: InboundMessage, link: Link): Promise<void> {
-    if (update.text === undefined) {
-      // Images are their own ticket; this path carries text only.
-      this.#logger.info("bridge.prompt.unsupported", {
-        updateId: update.updateId,
-        threadId: update.thread.threadId,
-      });
-      return;
-    }
-    const content: PromptContent = [{ type: "text", text: update.text }];
+  async #sendContent(input: PromptInput, link: Link, content: PromptContent): Promise<void> {
+    const imageCount = content.filter((part) => part.type === "image").length;
     if (this.#active.has(link.sessionId)) {
       await this.#backend.steer(link.sessionId, content);
       this.#logger.info("bridge.turn.steered", {
-        threadId: update.thread.threadId,
+        threadId: input.thread.threadId,
         sessionId: link.sessionId,
+        imageCount,
       });
-      await this.#notify(update.thread, STEER_ACK_TEXT);
+      await this.#notify(input.thread, STEER_ACK_TEXT);
       return;
     }
     await this.#backend.sendPrompt(link.sessionId, content);
     this.#active.add(link.sessionId);
     this.#logger.info("bridge.turn.started", {
-      threadId: update.thread.threadId,
+      threadId: input.thread.threadId,
       sessionId: link.sessionId,
+      imageCount,
     });
+  }
+
+  /** One rejected input produces one short reply, whatever failed inside it. */
+  async #reportMedia(input: PromptInput, error: unknown): Promise<void> {
+    if (!(error instanceof MediaError)) throw error;
+    this.#logger.info("bridge.prompt.rejected", {
+      threadId: input.thread.threadId,
+      reason: error.failure,
+      count: input.updateIds.length,
+    });
+    await this.#notify(input.thread, mediaNotice(error.failure));
   }
 
   /**
