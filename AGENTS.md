@@ -32,7 +32,9 @@ pi 没有会话列表接口，也无法定向订阅某个会话的事件。给 p
 | **session** | backend 侧的会话，由 backend 分配 id 并持久化 |
 | **platform** | 即时通讯平台。当前只有 `telegram` |
 | **thread** | platform 侧的会话容器。Telegram 里是私聊 topic（`message_thread_id`） |
-| **link** | 一条 thread ↔ session 的映射记录。本项目唯一必须持久化的状态 |
+| **link** | 一条 thread ↔ session 的映射记录 |
+| **polling checkpoint** | 已完成处理或已隔离的最高 Telegram update id |
+| **dead letter** | 达到重试上限后隔离的 Telegram update 与失败摘要 |
 | **turn** | 一次「用户发消息 → agent 输出完毕」的完整往返 |
 
 禁止混用：不写 chat/conversation/room 指代 thread，不写 agent/instance 指代 session。
@@ -63,12 +65,13 @@ scripts/           可重复的本机安装与运维向导
 
 ## 核心抽象
 
-backend adapter 必须实现六个动作，多一个都不加：
+backend adapter 必须实现七个动作，多一个都不加：
 
 ```
 listSessions()                    列出会话
 createSession(cwd)                在允许的工作目录创建会话
-sendPrompt(sessionId, text)       向指定会话发消息
+sendPrompt(sessionId, content)    向空闲会话发送 prompt content
+steer(sessionId, content)         向运行中的会话发送 prompt content
 subscribe(handler)                订阅事件流，handler 收到的事件带 sessionId
 respondApproval(requestId, ok)    回应审批请求
 close()                           关闭连接与后台重连
@@ -98,8 +101,9 @@ dsh 的全量流过滤、RPC 信封细节全部在 `backends/dsh.ts` 内部吸�
 - **`{markdown: ...}` 入口与结构化 `blocks` 渲染效果完全一致**（DOM 对比逐项相同）。
   所以默认走 markdown 入口，不自己构造 block 树。只有需要 `details` 折叠、
   `thinking` 状态这类 markdown 表达不了的语义时才用 blocks。
-- **超长输出不用自己切分**。200 行代码块 Telegram 自动折叠成 "Show more"。
-  单条消息上限仍是 4096 字符（4097 报 `MESSAGE_TOO_LONG`）。
+- **Rich Message 上限按 32768 UTF-8 字符处理**。最终消息使用 `sendRichMessage`，
+  保守按 32000 UTF-8 字符分片。普通 `sendMessage` / `sendMessageDraft` 的上限仍是
+  4096 字符；200 行代码块在单条限制内会自动折叠成 "Show more"。
 - **topics 开关在 BotFather Mini App 的 Threaded mode**，不在旧版聊天菜单，也没有 API 方法可开。
   开启后 `getMe` 的 `has_topics_enabled` 为 true。
 - **回复必须带 `message_thread_id`**，否则消息落到主聊天而不是那个 topic。
@@ -230,6 +234,10 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-24：完成 Telegram platform loop 设计，见
+  `docs/adr/0003-telegram-platform-loop.md`。Backend 契约加入结构化 prompt content 与
+  `steer`，成为七动作；确认私聊 topic 菜单、Rich Message 流式与最终落地、图片输入、
+  polling checkpoint / dead letter、防重复优先的崩溃语义、SQLite v2迁移和部署前 E2E。
 - 2026-08-24：完成 dsh adapter 设计，见 `docs/adr/0002-dsh-adapter.md`。Backend
   契约增加 `close()`，正式成为六动作；确认 HTTP unary + mux/host 双 WebSocket
   downlink、审批 response 关联、每 subscriber 每 session 64 事件有界队列、cwd root
