@@ -5,9 +5,13 @@
  * Startup validates that file, proves the bot can work in topics, and then
  * polls Telegram. Every accepted update goes to the runtime, which owns the
  * menus and the links.
+ *
+ * A second argument runs a local command against the same configuration and
+ * exits instead of polling. `dead-letters list` is the only one: it reads what
+ * the bridge gave up on, and it needs no bot token and no backend.
  */
 import { DshBackend } from "./backends/dsh.ts";
-import { loadConfig } from "./config.ts";
+import { loadConfig, type BridgeConfig } from "./config.ts";
 import { createLogger } from "./log.ts";
 import { BridgeRuntime } from "./runtime/runtime.ts";
 import { Store } from "./store/store.ts";
@@ -21,6 +25,11 @@ async function main(): Promise<void> {
     throw new Error("Usage: node --experimental-strip-types src/index.ts <config.json>");
   }
   const config = await loadConfig(configPath);
+  const command = process.argv.slice(3);
+  if (command.length > 0) {
+    runCommand(command, config);
+    return;
+  }
   const logger = createLogger({ level: config.logLevel });
   const allowlist = new Allowlist(config.allowedUserIds);
   const api = new TelegramApi({ token: config.botToken, logger });
@@ -57,6 +66,10 @@ async function main(): Promise<void> {
     signal: controller.signal,
   });
 
+  // Whatever the last run left mid-flight is isolated and reported before a
+  // new update is accepted, so recovery cannot race the work it is recovering.
+  await runtime.recover();
+
   // Subscribing before polling means a turn already running in dsh's own Web UI
   // renders from its next event, not from the next Telegram message.
   await runtime.start();
@@ -65,6 +78,7 @@ async function main(): Promise<void> {
     await runUpdateLoop({
       api,
       allowlist,
+      checkpoint: store,
       logger,
       signal: controller.signal,
       onUpdate: (update) => runtime.handleUpdate(update),
@@ -73,6 +87,26 @@ async function main(): Promise<void> {
     await backend.close();
     store.close();
     logger.info("bridge.stopped");
+  }
+}
+
+/**
+ * Prints one JSON line per isolated update.
+ *
+ * A dead letter has no column for prompt text, a caption, an image, or a
+ * token, so the whole record is safe to print as it stands.
+ */
+function runCommand(command: readonly string[], config: BridgeConfig): void {
+  if (command[0] !== "dead-letters" || command[1] !== "list" || command.length !== 2) {
+    throw new Error("Usage: <config.json> [dead-letters list]");
+  }
+  const store = new Store(config.databasePath);
+  try {
+    for (const record of store.listDeadLetters()) {
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+    }
+  } finally {
+    store.close();
   }
 }
 

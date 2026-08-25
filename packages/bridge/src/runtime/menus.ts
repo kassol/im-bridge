@@ -12,10 +12,13 @@
  */
 import type { Session } from "../backends/types.ts";
 import type { InlineKeyboard, InlineKeyboardButton } from "../telegram/api.ts";
+import { headChars } from "../telegram/markdown.ts";
 import { encodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
 
 /** Sessions shown per page. More rows than this stops fitting on a phone. */
 export const PAGE_SIZE = 8;
+/** How much of the backend's reason an approval message quotes. */
+export const APPROVAL_REASON_LIMIT = 500;
 /** Enough of a title to recognise a session, short enough for a button. */
 const LABEL_LIMIT = 40;
 
@@ -38,6 +41,12 @@ export const UNKNOWN_COMMAND_TEXT = "无法识别的命令。";
 export const MENU_EXPIRED_TEXT = "菜单来自上一次运行，已失效。发送 /manage 重新打开。";
 export const MENU_EXPIRED_NOTICE = "菜单已失效";
 export const UNLINKED_TEXT = "本 topic 尚未绑定 session。";
+export const APPROVAL_PREFIX = "后端请求审批：";
+export const APPROVAL_ALLOWED_TEXT = "已允许";
+export const APPROVAL_REJECTED_TEXT = "已拒绝";
+export const APPROVAL_ELSEWHERE_TEXT = "已在其他客户端处理";
+export const APPROVAL_EXPIRED_TEXT = "审批请求已失效";
+export const APPROVAL_UNLINKED_TEXT = "本 topic 已不再绑定该 session，审批未处理";
 export const MESSAGE_DISCARDED_TEXT = `${UNLINKED_TEXT}这条消息没有发给任何 session，请先绑定。`;
 
 /**
@@ -134,6 +143,32 @@ export function unknownCommandMenu(epoch: string): MenuView {
     text: `${UNKNOWN_COMMAND_TEXT}发送 /manage 打开管理菜单。`,
     keyboard: [[button(epoch, "管理", { kind: "manage" })]],
   };
+}
+
+/**
+ * One approval request, as the user has to answer it.
+ *
+ * The backend's reason is quoted, bounded: it explains which tool wants to
+ * run, and a tool call can carry a long argument list.
+ */
+export function approvalMenu(epoch: string, token: string, prompt: string): MenuView {
+  return {
+    text: `${APPROVAL_PREFIX}${headChars(prompt, APPROVAL_REASON_LIMIT)}`,
+    keyboard: [
+      [
+        button(epoch, "允许一次", { kind: "allow", token }),
+        button(epoch, "拒绝", { kind: "reject", token }),
+      ],
+    ],
+  };
+}
+
+/**
+ * The same message once it is no longer a question. The keyboard goes: the
+ * outcome is already decided, and a second tap must have nothing to hit.
+ */
+export function approvalResolvedMenu(outcome: string): MenuView {
+  return { text: `${APPROVAL_PREFIX}${outcome}`, keyboard: [] };
 }
 
 export function expiredMenu(): MenuView {

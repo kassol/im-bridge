@@ -26,6 +26,8 @@ const ACTIONS: CallbackAction[] = [
   { kind: "existing", page: 12 },
   { kind: "bind", sessionSuffix: "6x5c4v01" },
   { kind: "unlink" },
+  { kind: "allow", token: "7" },
+  { kind: "reject", token: "7" },
   { kind: "close" },
 ];
 

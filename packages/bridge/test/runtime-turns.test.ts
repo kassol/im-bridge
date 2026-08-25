@@ -285,14 +285,17 @@ describe("event routing", () => {
     expect(calls("sendRichMessage")).toHaveLength(0);
   });
 
-  it("leaves an approval to the approval ticket without answering it", async () => {
+  it("asks the linked topic to decide an approval", async () => {
     linkSession();
     await start();
 
     await backend.emit({ type: "approval", sessionId: SESSION, requestId: "req-1", prompt: "run rm" });
     await tick(5_000);
 
-    expect(server.calls).toHaveLength(0);
+    const asked = lastCall("sendMessage");
+    expect(asked.body["message_thread_id"]).toBe(THREAD);
+    expect(textOf(asked)).toContain("run rm");
+    expect(backend.approvals).toHaveLength(0);
   });
 });
 

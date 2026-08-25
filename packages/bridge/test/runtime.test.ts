@@ -514,6 +514,7 @@ describe("polling loop", () => {
     const loop = runUpdateLoop({
       api,
       allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: store,
       logger: silentLogger(),
       signal: controller.signal,
       onUpdate: (update) => runtime.handleUpdate(update),

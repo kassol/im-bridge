@@ -504,9 +504,11 @@ describe("prompt delivery", () => {
   it("releases the memory budget after a failed prompt", async () => {
     linkSession();
     await start();
-    const failing = vi.spyOn(backend, "sendPrompt").mockRejectedValueOnce(new Error("dsh refused"));
+    const failing = vi.spyOn(backend, "sendPrompt").mockRejectedValue(new Error("dsh refused"));
 
-    await expect(runtime.handleUpdate(onePhoto())).rejects.toThrow("dsh refused");
+    // Three attempts fail and the update is isolated; each attempt reserved
+    // the image budget again.
+    await runtime.handleUpdate(onePhoto());
     failing.mockRestore();
 
     // The budget released in `finally`, so the next image prompt runs at once.

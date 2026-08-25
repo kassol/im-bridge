@@ -21,6 +21,13 @@ export class FakeBackend implements Backend {
   readonly created: Array<{ cwd: string; sessionId: string }> = [];
   /** Every `sendPrompt` and `steer` call, in order, with which one it was. */
   readonly prompts: Array<{ kind: "prompt" | "steer"; sessionId: string; content: PromptContent }> = [];
+  /** Every `respondApproval` call, in order, answered or not. */
+  readonly approvals: Array<{ requestId: string; approved: boolean }> = [];
+  /**
+   * Decides what `respondApproval` does. Throwing plays the race dsh has:
+   * another client answered first and the adapter no longer knows the request.
+   */
+  respondApprovalWith: (requestId: string, approved: boolean) => void = () => {};
   listCalls = 0;
 
   #sessions: Session[];
@@ -60,7 +67,10 @@ export class FakeBackend implements Backend {
     };
   }
 
-  async respondApproval(_requestId: string, _approved: boolean): Promise<void> {}
+  async respondApproval(requestId: string, approved: boolean): Promise<void> {
+    this.approvals.push({ requestId, approved });
+    this.respondApprovalWith(requestId, approved);
+  }
 
   async close(): Promise<void> {}
 

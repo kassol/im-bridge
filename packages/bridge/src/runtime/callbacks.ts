@@ -7,10 +7,13 @@
  *   - Every payload carries the process epoch. A button drawn before a restart
  *     decodes into a foreign epoch and is answered as expired instead of being
  *     applied to whatever the menu shows now.
- *   - The payload names a stable key — a cwd alias or the tail of a session id —
- *     never a position in the list the menu happened to render. The list is
- *     rebuilt on every click, so an index would silently point at another
- *     session once a session appeared or was bound elsewhere.
+ *   - The payload names a stable key — a cwd alias, the tail of a session id, or
+ *     the short token of an approval — never a position in the list the menu
+ *     happened to render. The list is rebuilt on every click, so an index would
+ *     silently point at another session once a session appeared or was bound
+ *     elsewhere. An approval token is resolved against a map that lives only in
+ *     the process that filed the request, which is exactly as long as its epoch
+ *     is valid.
  *
  * Telegram allows 64 bytes of callback data. `encodeCallback` proves the budget
  * rather than trusting it.
@@ -34,6 +37,10 @@ export type CallbackAction =
   /** Bind the session whose id ends with `sessionSuffix`. */
   | { readonly kind: "bind"; readonly sessionSuffix: string }
   | { readonly kind: "unlink" }
+  /** Allow the approval this process filed under `token`, once. */
+  | { readonly kind: "allow"; readonly token: string }
+  /** Reject the approval this process filed under `token`. */
+  | { readonly kind: "reject"; readonly token: string }
   | { readonly kind: "close" };
 
 export interface Callback {
@@ -48,6 +55,8 @@ const KIND_CODES = {
   existing: "e",
   bind: "b",
   unlink: "u",
+  allow: "a",
+  reject: "r",
   close: "x",
 } as const;
 
@@ -91,6 +100,7 @@ function argumentOf(action: CallbackAction): string {
   if (action.kind === "create") return action.alias;
   if (action.kind === "existing") return String(action.page);
   if (action.kind === "bind") return action.sessionSuffix;
+  if (action.kind === "allow" || action.kind === "reject") return action.token;
   return "";
 }
 
@@ -100,6 +110,8 @@ function readAction(code: string, argument: string): CallbackAction | undefined 
   if (code === KIND_CODES.unlink) return { kind: "unlink" };
   if (code === KIND_CODES.close) return { kind: "close" };
   if (code === KIND_CODES.create) return argument === "" ? undefined : { kind: "create", alias: argument };
+  if (code === KIND_CODES.allow) return argument === "" ? undefined : { kind: "allow", token: argument };
+  if (code === KIND_CODES.reject) return argument === "" ? undefined : { kind: "reject", token: argument };
   if (code === KIND_CODES.bind) {
     return argument === "" ? undefined : { kind: "bind", sessionSuffix: argument };
   }

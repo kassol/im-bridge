@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLogger, type Logger } from "../src/log.ts";
 import { Allowlist } from "../src/telegram/allowlist.ts";
 import { TelegramApi, type TelegramUpdate } from "../src/telegram/api.ts";
-import { runUpdateLoop, TOPIC_INSTRUCTION, type InboundUpdate } from "../src/telegram/updates.ts";
+import {
+  runUpdateLoop,
+  TOPIC_INSTRUCTION,
+  type InboundUpdate,
+  type PollingCheckpoint,
+} from "../src/telegram/updates.ts";
 import { startFakeTelegram, type FakeReply, type FakeTelegram } from "./fake-telegram.ts";
 
 const TOKEN = "8123456789:AAF-abcdefghijklmnopqrstuvwxyz012345678";
@@ -34,11 +39,24 @@ function silentLogger(): Logger {
   return createLogger({ level: "debug", write: () => {} });
 }
 
+/** The durable floor the loop polls from, with the store left out of it. */
+function memoryCheckpoint(start = 0): PollingCheckpoint & { readonly settled: number[] } {
+  const settled: number[] = [];
+  return {
+    settled,
+    checkpoint: () => start,
+    settleUpdates: (updateIds) => {
+      settled.push(...updateIds);
+      return start;
+    },
+  };
+}
+
 /** Runs the loop over one batch of updates, then cancels it. */
 async function drain(
   updates: TelegramUpdate[],
   options: { polls?: number } = {},
-): Promise<{ server: FakeTelegram; received: InboundUpdate[] }> {
+): Promise<{ server: FakeTelegram; received: InboundUpdate[]; settled: number[] }> {
   const server = await fake((call) => {
     if (call.method !== "getUpdates") return { json: { ok: true, result: { message_id: 500 } } };
     return call.count === 1 ? { json: { ok: true, result: updates } } : { hang: true };
@@ -46,9 +64,11 @@ async function drain(
   const api = new TelegramApi({ token: TOKEN, baseUrl: server.baseUrl });
   const controller = new AbortController();
   const received: InboundUpdate[] = [];
+  const checkpoint = memoryCheckpoint();
   const loop = runUpdateLoop({
     api,
     allowlist: new Allowlist([AUTHORISED]),
+    checkpoint,
     logger: silentLogger(),
     signal: controller.signal,
     onUpdate: (update) => {
@@ -58,7 +78,7 @@ async function drain(
   await waitFor(() => server.calls.filter((call) => call.method === "getUpdates").length === (options.polls ?? 2));
   controller.abort();
   await loop;
-  return { server, received };
+  return { server, received, settled: checkpoint.settled };
 }
 
 function privateTopicMessage(fields: Record<string, unknown>, userId = AUTHORISED): TelegramUpdate {
@@ -223,6 +243,35 @@ describe("update filtering", () => {
   });
 });
 
+describe("polling checkpoint", () => {
+  it("resumes from the persisted checkpoint and settles what it drops", async () => {
+    const server = await fake((call) =>
+      call.count === 1
+        ? { json: { ok: true, result: [privateTopicMessage({ text: "run rm -rf /" }, STRANGER)] } }
+        : { hang: true },
+    );
+    const api = new TelegramApi({ token: TOKEN, baseUrl: server.baseUrl });
+    const controller = new AbortController();
+    const checkpoint = memoryCheckpoint(700);
+    const loop = runUpdateLoop({
+      api,
+      allowlist: new Allowlist([AUTHORISED]),
+      checkpoint,
+      logger: silentLogger(),
+      signal: controller.signal,
+      onUpdate: () => {},
+    });
+    await waitFor(() => server.calls.filter((call) => call.method === "getUpdates").length === 2);
+    controller.abort();
+    await loop;
+
+    // The first poll already asks past everything the last run confirmed.
+    expect(server.calls[0]?.body).toMatchObject({ offset: 701 });
+    // Nothing else will finish a dropped update, so the loop settles it.
+    expect(checkpoint.settled).toEqual([10]);
+  });
+});
+
 describe("update loop lifecycle", () => {
   it("backs off from one to thirty seconds and recovers", async () => {
     const slept: number[] = [];
@@ -232,6 +281,7 @@ describe("update loop lifecycle", () => {
     const loop = runUpdateLoop({
       api,
       allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: memoryCheckpoint(),
       logger: silentLogger(),
       signal: controller.signal,
       onUpdate: () => {},
@@ -257,6 +307,7 @@ describe("update loop lifecycle", () => {
     const loop = runUpdateLoop({
       api,
       allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: memoryCheckpoint(),
       logger: silentLogger(),
       signal: controller.signal,
       onUpdate: () => {},
@@ -277,6 +328,7 @@ describe("update loop lifecycle", () => {
     const loop = runUpdateLoop({
       api,
       allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: memoryCheckpoint(),
       logger: silentLogger(),
       signal: controller.signal,
       onUpdate: () => {},
@@ -300,6 +352,7 @@ describe("update loop lifecycle", () => {
     const loop = runUpdateLoop({
       api,
       allowlist: new Allowlist([AUTHORISED]),
+      checkpoint: memoryCheckpoint(),
       logger: createLogger({ level: "debug", write: (line) => lines.push(line) }),
       signal: controller.signal,
       onUpdate: () => {

@@ -59,8 +59,9 @@ packages/bridge/src/
   backends/        backend adapter。每个 backend 实现同一个接口
   telegram/        Telegram 平台适配：收 update、发消息、渲染、
                    Rich Message 预算与 Markdown 分片
-  runtime/         update 编排：私聊 topic 管理菜单、callback 校验、link 变更、
-                   turn 编排与流式草稿、图片与相册输入、图片内存预算
+  runtime/         update 编排：按 thread 排队与四线程并发上限、durable processing
+                   与 dead letter、私聊 topic 管理菜单、callback 校验、link 变更、
+                   turn 编排与流式草稿、图片与相册输入、图片内存预算、审批 UI
   store/           SQLite schema v2：link 表、polling checkpoint、
                    update processing 记录、dead letter
 docs/              实测结论与协议记录
@@ -233,6 +234,9 @@ pnpm -F bridge dev <config.json>       # 同上，改动即重启
 pnpm -F bridge test       # 单测
 pnpm -F bridge typecheck  # 类型检查
 
+# 列出被隔离的 update（每行一条 JSON，只有元数据；不启动轮询、不连 backend）
+pnpm -F bridge start <config.json> dead-letters list
+
 # dsh 后端（交互式安装、配置 LaunchAgent 并验证）
 ./scripts/setup-dsh.sh
 
@@ -242,6 +246,26 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：打通可靠 update 处理与审批。update 按 thread 串行、全局最多 4 个 thread
+  同时跑（`src/runtime/scheduler.ts`：每 thread 一条 FIFO 队列，一个任务让出一次名额，
+  忙 thread 不会压住等待中的 thread）。每个处理单元在第一个 Telegram / Backend 副作用
+  之前落 processing 记录，之后每个有返回 id 的副作用记一步（`src/runtime/processing.ts`：
+  step 是本文件的常量，进程内最多重试 3 次并从已记录的步骤续跑——重试不会再建一个
+  session、不会再发一次 prompt；重试用尽写一条只有元数据的 dead letter 并结清该 update）。
+  dead letter 的 errorSummary 由错误类型拼出，异常消息不入库、不进日志。
+  相册的所有 update id 共用一个处理结果与一个 checkpoint 单元，收集期间 anchor 记录
+  挡住 checkpoint。`runUpdateLoop` 的 offset 改由 store 的 polling checkpoint 决定
+  （`checkpoint + 1`），进程内再叠一层"已派发"下限；被丢弃与主聊天指引的 update 由轮询
+  循环结清，投递出去的由 runtime 结清，checkpoint 只走连续前缀，不跳过未完成的空档。
+  启动时 `BridgeRuntime.recover()` 把所有不确定的 processing 记录转成 dead letter、
+  不重试，并给有 thread 标识的 topic 发一句「上次输入可能未送达，请重新发送」，
+  同时清掉 30 天前的 dead letter。新增本地命令 `dead-letters list`（`src/index.ts`）。
+  审批 UI：linked topic 收到 approval 事件发一条中文消息带「允许一次 / 拒绝」，
+  callback data 带 epoch 与短 token（requestId 留在进程内的映射里，随进程与 epoch 一起
+  失效）；每次点击重新校验白名单、私聊 topic、epoch、当前 link 与请求本身，成功后移除
+  键盘并把原消息改成「已允许 / 已拒绝」；被 dsh Web UI 或其他客户端抢先回答的请求改成
+  「已在其他客户端处理」且不再报错；没有 link 的审批只记 `bridge.approval.unlinked`
+  并保持 pending，绝不自动拒绝。新增 25 项单测。
 - 2026-08-25：图片与相册进入 prompt 路径。linked topic 里的 Telegram photo 与
   image document 走和文字同一条输入：photo 选不超过 5 MiB 的最大变体，document 校验
   MIME（JPEG / PNG / WebP）并保留安全文件名，caption 作为 text 部分，无 caption 用固定
