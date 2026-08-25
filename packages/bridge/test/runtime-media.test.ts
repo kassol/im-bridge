@@ -39,7 +39,7 @@ const CHAT = 5000;
 const THREAD = 31;
 const SESSION = "01j8z4qk9m7f3b2n6x5c4v-0001";
 const WORK_DIR = "/private/tmp/im-bridge-work";
-const ALIASES = new Map([["work", WORK_DIR]]);
+const ROOTS = new Map([["work", WORK_DIR]]);
 const MIB = 1024 * 1024;
 
 /** Small enough to compare byte for byte; the format is never parsed here. */
@@ -105,7 +105,7 @@ async function start(sessions: readonly Session[] = [session(SESSION)]): Promise
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
-    cwdAliases: ALIASES,
+    cwdRoots: ROOTS,
     logger: silentLogger(),
     epoch: "epoch1",
   });

@@ -99,7 +99,7 @@ async function build(options: { baseUrl?: string } = {}): Promise<void> {
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
-    cwdAliases: new Map([["work", WORK_DIR]]),
+    cwdRoots: new Map([["work", WORK_DIR]]),
     logger: silentLogger(),
     epoch: "epoch1",
     polling,
@@ -277,7 +277,7 @@ describe("BridgeRuntime.shutdown", () => {
       backend,
       store,
       allowlist: new Allowlist([AUTHORISED]),
-      cwdAliases: new Map([["work", WORK_DIR]]),
+      cwdRoots: new Map([["work", WORK_DIR]]),
       logger: createLogger({ level: "info", write: (line) => lines.push(line) }),
       polling,
     });

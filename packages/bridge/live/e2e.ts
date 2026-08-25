@@ -201,7 +201,7 @@ async function main(): Promise<void> {
   const store = new Store(storePath);
   const backend = new DshBackend({
     baseUrl: config.dshUrl,
-    allowedCwdRoots: [...config.cwdAliases.values()],
+    allowedCwdRoots: [...config.cwdRoots.values()],
   });
   const polling = new AbortController();
   const runtime = new BridgeRuntime({
@@ -209,7 +209,7 @@ async function main(): Promise<void> {
     backend,
     store,
     allowlist: new Allowlist(config.allowedUserIds),
-    cwdAliases: config.cwdAliases,
+    cwdRoots: config.cwdRoots,
     logger,
     polling,
   });
@@ -327,7 +327,7 @@ async function proveTopicMenu(harness: Harness): Promise<void> {
 
 async function proveSessionCreate(harness: Harness): Promise<void> {
   instruct(harness, "session-create", [
-    "点「新建 session」，选一个工作目录，等待绑定结果",
+    "点「新建 session」，按提示选工作目录与其下的子目录，等待绑定结果",
   ]);
   await waitFor(() => linkOf(harness) !== undefined, "a new link", HUMAN_TIMEOUT_MS);
   const link = requireLink(harness);
@@ -575,14 +575,14 @@ async function proveRestartRecovery(harness: Harness): Promise<void> {
   const store = new Store(harness.storePath);
   const backend = new DshBackend({
     baseUrl: harness.config.dshUrl,
-    allowedCwdRoots: [...harness.config.cwdAliases.values()],
+    allowedCwdRoots: [...harness.config.cwdRoots.values()],
   });
   const restarted = new BridgeRuntime({
     api: harness.api,
     backend,
     store,
     allowlist: new Allowlist(harness.config.allowedUserIds),
-    cwdAliases: harness.config.cwdAliases,
+    cwdRoots: harness.config.cwdRoots,
     logger: harness.logger,
   });
   try {

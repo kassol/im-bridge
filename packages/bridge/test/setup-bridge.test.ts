@@ -65,7 +65,7 @@ interface WriterResult {
 function writeConfig(options: {
   token: string;
   allowlist: string;
-  aliases: string;
+  roots: string;
   databasePath: string;
   dshUrl?: string;
   logLevel?: string;
@@ -83,7 +83,7 @@ function writeConfig(options: {
       env: {
         ...process.env,
         BRIDGE_ALLOWLIST: options.allowlist,
-        BRIDGE_ALIASES: options.aliases,
+        BRIDGE_ROOTS: options.roots,
         BRIDGE_DATABASE: options.databasePath,
         BRIDGE_DSH_URL: options.dshUrl ?? "http://127.0.0.1:3080",
         BRIDGE_LOG_LEVEL: options.logLevel ?? "info",
@@ -136,14 +136,14 @@ describe("setup-bridge.sh wizard library", () => {
 
 describe("setup-bridge.sh configuration file", () => {
   it("writes a mode-0600 config the bridge loader accepts", () => {
-    const aliasDir = join(workspace, "work");
-    mkdirSync(aliasDir);
+    const rootDir = join(workspace, "work");
+    mkdirSync(rootDir);
     const out = join(workspace, "config.json");
 
     const result = writeConfig({
       token: FAKE_TOKEN,
       allowlist: "149523521, 88",
-      aliases: `work=${aliasDir}`,
+      roots: `work=${rootDir}`,
       databasePath: join(workspace, "bridge.db"),
       out,
     });
@@ -155,7 +155,7 @@ describe("setup-bridge.sh configuration file", () => {
     expect(document).toEqual({
       botToken: FAKE_TOKEN,
       allowedUserIds: [149523521, 88],
-      cwdAliases: { work: aliasDir },
+      cwdRoots: { work: rootDir },
       databasePath: join(workspace, "bridge.db"),
       dshUrl: "http://127.0.0.1:3080",
       logLevel: "info",
@@ -168,7 +168,7 @@ describe("setup-bridge.sh configuration file", () => {
     const result = writeConfig({
       token: "not-a-token-but-still-secret",
       allowlist: "1",
-      aliases: `work=${workspace}`,
+      roots: `work=${workspace}`,
       databasePath: join(workspace, "bridge.db"),
       out,
     });
@@ -183,7 +183,7 @@ describe("setup-bridge.sh configuration file", () => {
     const result = writeConfig({
       token: FAKE_TOKEN,
       allowlist: "",
-      aliases: `work=${workspace}`,
+      roots: `work=${workspace}`,
       databasePath: join(workspace, "bridge.db"),
       out: join(workspace, "config.json"),
     });
@@ -191,11 +191,11 @@ describe("setup-bridge.sh configuration file", () => {
     expect(result.stderr).toContain("BRIDGE_ALLOWLIST is empty");
   });
 
-  it("refuses a relative cwd alias directory", () => {
+  it("refuses a relative cwd root directory", () => {
     const result = writeConfig({
       token: FAKE_TOKEN,
       allowlist: "1",
-      aliases: "work=relative/path",
+      roots: "work=relative/path",
       databasePath: join(workspace, "bridge.db"),
       out: join(workspace, "config.json"),
     });
@@ -204,13 +204,13 @@ describe("setup-bridge.sh configuration file", () => {
   });
 
   it("reports a wrong file mode through the loader rather than trusting the writer", () => {
-    const aliasDir = join(workspace, "work");
-    mkdirSync(aliasDir);
+    const rootDir = join(workspace, "work");
+    mkdirSync(rootDir);
     const out = join(workspace, "config.json");
     writeConfig({
       token: FAKE_TOKEN,
       allowlist: "1",
-      aliases: `work=${aliasDir}`,
+      roots: `work=${rootDir}`,
       databasePath: join(workspace, "bridge.db"),
       out,
     });
@@ -237,13 +237,13 @@ describe("setup-bridge.sh token handling", () => {
   });
 
   it("keeps the token out of every generated artifact except the config file", () => {
-    const aliasDir = join(workspace, "work");
-    mkdirSync(aliasDir);
+    const rootDir = join(workspace, "work");
+    mkdirSync(rootDir);
     const configPath = join(workspace, "config.json");
     const result = writeConfig({
       token: FAKE_TOKEN,
       allowlist: "1",
-      aliases: `work=${aliasDir}`,
+      roots: `work=${rootDir}`,
       databasePath: join(workspace, "bridge.db"),
       out: configPath,
     });

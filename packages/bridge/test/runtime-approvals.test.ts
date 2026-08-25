@@ -40,7 +40,7 @@ const REQUEST = "rpc-1a2b3c4d-5e6f-7890-abcd-ef0123456789";
 const APPROVAL_MESSAGE = 910;
 const EPOCH = "epoch1";
 const WORK_DIR = "/private/tmp/im-bridge-work";
-const ALIASES = new Map([["work", WORK_DIR]]);
+const ROOTS = new Map([["work", WORK_DIR]]);
 
 interface Button {
   readonly text: string;
@@ -76,7 +76,7 @@ async function start(): Promise<void> {
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
-    cwdAliases: ALIASES,
+    cwdRoots: ROOTS,
     logger: silentLogger(),
     epoch: EPOCH,
   });

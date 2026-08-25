@@ -289,9 +289,9 @@ ask ALLOWED_USER_IDS "Allowed Telegram user ids, comma separated:"
   warn "the allowlist must be one or more numeric user ids; it is the only authentication the bridge has"
   exit 1
 }
-ask CWD_ALIASES "cwd aliases as name=/absolute/path, comma separated:"
-[[ "$CWD_ALIASES" =~ ^[A-Za-z0-9_-]{1,32}=/[^,]*(,[[:space:]]*[A-Za-z0-9_-]{1,32}=/[^,]*)*$ ]] || {
-  warn "every alias must be name=/absolute/path"
+ask CWD_ROOTS "cwd roots as name=/absolute/parent-directory, comma separated:"
+[[ "$CWD_ROOTS" =~ ^[A-Za-z0-9_-]{1,32}=/[^,]*(,[[:space:]]*[A-Za-z0-9_-]{1,32}=/[^,]*)*$ ]] || {
+  warn "every cwd root must be name=/absolute/parent-directory"
   exit 1
 }
 ask DATABASE_PATH "SQLite database path [$HOME/.local/share/im-bridge/bridge.db]:"
@@ -307,12 +307,12 @@ mkdir -p "$(dirname "$DATABASE_PATH")"
 # Non-secret answers only. A re-run offers them again; the token is asked for
 # every time, because there is no safe place to keep it outside the config.
 write_env ALLOWED_USER_IDS "$ALLOWED_USER_IDS"
-write_env CWD_ALIASES "$CWD_ALIASES"
+write_env CWD_ROOTS "$CWD_ROOTS"
 write_env DATABASE_PATH "$DATABASE_PATH"
 write_env DSH_URL "$DSH_URL"
 write_env LOG_LEVEL "$LOG_LEVEL"
 chmod 600 "$ENV_FILE"
-note "Collected the allowlist, the aliases, the database path, the dsh URL, and the log level."
+note "Collected the allowlist, the cwd roots, the database path, the dsh URL, and the log level."
 pause "Configuration collected. Press Enter to write it."
 
 stage "Write and validate the configuration"
@@ -352,21 +352,21 @@ if (allowedUserIds.length === 0 || !allowedUserIds.every(Number.isSafeInteger)) 
   throw new Error("the allowlist must be one or more numeric user ids");
 }
 
-const cwdAliases = {};
-for (const entry of required("BRIDGE_ALIASES").split(",")) {
+const cwdRoots = {};
+for (const entry of required("BRIDGE_ROOTS").split(",")) {
   const at = entry.indexOf("=");
-  if (at < 0) throw new Error("every cwd alias must be name=/absolute/path");
+  if (at < 0) throw new Error("every cwd root must be name=/absolute/parent-directory");
   const alias = entry.slice(0, at).trim();
   const directory = entry.slice(at + 1).trim();
-  if (!/^[A-Za-z0-9_-]{1,32}$/.test(alias)) throw new Error("invalid cwd alias name: " + alias);
-  if (!directory.startsWith("/")) throw new Error("cwd alias " + alias + " needs an absolute path");
-  cwdAliases[alias] = directory;
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(alias)) throw new Error("invalid cwd root name: " + alias);
+  if (!directory.startsWith("/")) throw new Error("cwd root " + alias + " needs an absolute path");
+  cwdRoots[alias] = directory;
 }
 
 const document = {
   botToken: token,
   allowedUserIds,
-  cwdAliases,
+  cwdRoots,
   databasePath: required("BRIDGE_DATABASE"),
   dshUrl: required("BRIDGE_DSH_URL"),
   logLevel: required("BRIDGE_LOG_LEVEL"),
@@ -379,7 +379,7 @@ rm -f "$CONFIG_TMP"
 # umask 077 covers the window between creation and the explicit chmod.
 ( umask 077
   printf '%s' "$BOT_TOKEN" | BRIDGE_ALLOWLIST="$ALLOWED_USER_IDS" \
-    BRIDGE_ALIASES="$CWD_ALIASES" \
+    BRIDGE_ROOTS="$CWD_ROOTS" \
     BRIDGE_DATABASE="$DATABASE_PATH" \
     BRIDGE_DSH_URL="$DSH_URL" \
     BRIDGE_LOG_LEVEL="$LOG_LEVEL" \

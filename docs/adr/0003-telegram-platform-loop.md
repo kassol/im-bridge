@@ -50,6 +50,30 @@ An active turn blocks unlink. Unlink never deletes the backend session. A link
 to a session deleted outside the bridge is shown as invalid and offers explicit
 unlink and repair; it is not silently removed.
 
+#### Amendment 2026-08-25: sessions are created from subdirectories of cwd roots
+
+A configured alias names a parent directory, a cwd root, rather than one working
+directory. Creating a session picks a root, then a directory under it: the menu
+lists the immediate, non-hidden subdirectories read at the moment it is drawn,
+sorted by name, eight per page. The root step is skipped when one root is
+configured. The session cwd is the chosen directory, and the backend's allowed
+cwd roots are the configured roots, so the created cwd is always inside one.
+
+`cwdAliases` becomes `cwdRoots`. Alias syntax, case-insensitive uniqueness, and
+the requirement to resolve to a directory are unchanged.
+
+A button carries the root alias and an eight-character digest of the directory
+name, never the name and never a list position, because a directory name can be
+long or non-ASCII and callback data holds 64 bytes. Every click rereads the
+listing: the digest must match exactly one current name, that name must resolve
+through `realpath` to a path inside its root, and a vanished or ambiguous name
+is reported rather than guessed. A session label without a title is now the root
+alias, the directory name, and the last eight session-id characters.
+
+This amends "Real cwd paths are never shown": directory basenames under a
+configured root are shown to allowlisted users. Full paths still never appear in
+a message, a button, or callback data.
+
 ### Backend prompt content and steer
 
 The Backend contract gains a seventh action, `steer(sessionId, content)`. Both

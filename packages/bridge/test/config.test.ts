@@ -32,7 +32,7 @@ function validDocument(projectDir: string, root: string): Record<string, unknown
   return {
     botToken: TOKEN,
     allowedUserIds: [149523521],
-    cwdAliases: { work: projectDir },
+    cwdRoots: { work: projectDir },
     databasePath: join(root, "im-bridge.db"),
     dshUrl: "http://127.0.0.1:3080",
   };
@@ -47,7 +47,7 @@ describe("loadConfig", () => {
 
     expect(config.botToken).toBe(TOKEN);
     expect(config.allowedUserIds).toEqual([149523521]);
-    expect([...config.cwdAliases]).toEqual([["work", projectDir]]);
+    expect([...config.cwdRoots]).toEqual([["work", projectDir]]);
     expect(config.databasePath).toBe(join(root, "im-bridge.db"));
     expect(config.dshUrl).toBe("http://127.0.0.1:3080");
     expect(config.logLevel).toBe("debug");
@@ -112,27 +112,27 @@ describe("loadConfig", () => {
     await expect(loadConfig(fractional)).rejects.toThrow(/allowedUserIds/);
   });
 
-  it("rejects invalid alias syntax", async () => {
+  it("rejects invalid cwd root alias syntax", async () => {
     const { root, projectDir } = await workspace();
     for (const alias of ["", "a".repeat(33), "with space", "dot.alias", "斜杠"]) {
       const path = await writeConfig(root, {
         ...validDocument(projectDir, root),
-        cwdAliases: { [alias]: projectDir },
+        cwdRoots: { [alias]: projectDir },
       });
-      await expect(loadConfig(path)).rejects.toThrow(/cwd alias/);
+      await expect(loadConfig(path)).rejects.toThrow(/cwd root/);
     }
   });
 
-  it("rejects aliases that collide case-insensitively", async () => {
+  it("rejects cwd root aliases that collide case-insensitively", async () => {
     const { root, projectDir } = await workspace();
     const path = await writeConfig(root, {
       ...validDocument(projectDir, root),
-      cwdAliases: { Work: projectDir, work: projectDir },
+      cwdRoots: { Work: projectDir, work: projectDir },
     });
-    await expect(loadConfig(path)).rejects.toThrow(/duplicate cwd alias/i);
+    await expect(loadConfig(path)).rejects.toThrow(/duplicate cwd root/i);
   });
 
-  it("rejects a relative, missing, or non-directory cwd", async () => {
+  it("rejects a relative, missing, or non-directory cwd root", async () => {
     const { root, projectDir } = await workspace();
     const file = join(root, "notes.txt");
     await writeFile(file, "x", "utf8");
@@ -142,18 +142,18 @@ describe("loadConfig", () => {
       [file, /does not resolve to a directory/],
     ];
     for (const [dir, expected] of cases) {
-      const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdAliases: { work: dir } });
+      const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdRoots: { work: dir } });
       await expect(loadConfig(path)).rejects.toThrow(expected);
     }
   });
 
-  it("resolves an alias directory through symlinks", async () => {
+  it("resolves a cwd root through symlinks", async () => {
     const { root, projectDir } = await workspace();
     const link = join(root, "link");
     await symlink(projectDir, link);
-    const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdAliases: { work: link } });
+    const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdRoots: { work: link } });
     const config = await loadConfig(path);
-    expect(config.cwdAliases.get("work")).toBe(projectDir);
+    expect(config.cwdRoots.get("work")).toBe(projectDir);
   });
 
   it("rejects an unusable dsh url, database path, and log level", async () => {
@@ -166,9 +166,9 @@ describe("loadConfig", () => {
     await expect(loadConfig(level)).rejects.toThrow(/logLevel/);
   });
 
-  it("accepts an empty alias map", async () => {
+  it("accepts an empty cwd root map", async () => {
     const { root, projectDir } = await workspace();
-    const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdAliases: {} });
-    await expect(loadConfig(path)).resolves.toMatchObject({ cwdAliases: new Map() });
+    const path = await writeConfig(root, { ...validDocument(projectDir, root), cwdRoots: {} });
+    await expect(loadConfig(path)).resolves.toMatchObject({ cwdRoots: new Map() });
   });
 });

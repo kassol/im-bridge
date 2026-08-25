@@ -6,16 +6,17 @@
  * keeps every rendering rule — page bounds, labels, which button exists in
  * which state — testable without a server.
  *
- * Labels never contain a real path. A user sees a title, or a cwd alias with
- * the tail of the session id; the directory behind an alias stays in the
- * configuration file.
+ * Labels never contain a real path. A user sees a title, or a cwd root alias
+ * with one directory name under it and the tail of the session id; the
+ * directory the alias stands for stays in the configuration file.
  */
 import type { Session } from "../backends/types.ts";
 import type { InlineKeyboard, InlineKeyboardButton } from "../telegram/api.ts";
 import { charLength, headChars } from "../telegram/markdown.ts";
 import { encodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
+import type { DirectoryChoice } from "./directories.ts";
 
-/** Sessions shown per page. More rows than this stops fitting on a phone. */
+/** Sessions and directories shown per page. More rows stop fitting on a phone. */
 export const PAGE_SIZE = 8;
 /** How much of the backend's reason an approval message quotes. */
 export const APPROVAL_REASON_LIMIT = 500;
@@ -52,13 +53,14 @@ export const MESSAGE_DISCARDED_TEXT = `${UNLINKED_TEXT}这条消息没有发给�
 /**
  * A session name for a button.
  *
- * `alias` is the configured name of the session's cwd, or `undefined` when the
- * session runs somewhere the configuration does not name.
+ * `cwdName` is the configured name of the session's cwd — a root alias, or a
+ * root alias and one directory under it — or `undefined` when the session runs
+ * somewhere no configured root covers.
  */
-export function sessionLabel(session: Session, alias: string | undefined): string {
+export function sessionLabel(session: Session, cwdName: string | undefined): string {
   const title = session.title?.trim();
   if (title !== undefined && title !== "") return truncate(title);
-  return `${alias ?? "未知目录"} ${sessionSuffix(session.sessionId)}`;
+  return `${cwdName ?? "未知目录"} ${sessionSuffix(session.sessionId)}`;
 }
 
 export function unlinkedMenu(epoch: string, text: string = UNLINKED_TEXT): MenuView {
@@ -73,10 +75,45 @@ export function unlinkedMenu(epoch: string, text: string = UNLINKED_TEXT): MenuV
 }
 
 export function newSessionMenu(epoch: string, aliases: readonly string[]): MenuView {
-  const rows = aliases.map((alias) => [button(epoch, alias, { kind: "create", alias })]);
+  const rows = aliases.map((alias) => [button(epoch, alias, { kind: "root", alias, page: 0 })]);
   return {
     text: aliases.length === 0 ? "配置里没有可用的工作目录。" : "选择工作目录，新建 session：",
     keyboard: [...rows, [backButton(epoch), closeButton(epoch)]],
+  };
+}
+
+/**
+ * One page of the subdirectories of `alias`, as they were on disk when this
+ * menu was drawn. A button carries the digest of a name, so the runtime looks
+ * the name up again before it creates anything.
+ */
+export function subdirectoryMenu(
+  epoch: string,
+  alias: string,
+  choices: readonly DirectoryChoice[],
+  page: number,
+): MenuView {
+  const pageCount = Math.max(1, Math.ceil(choices.length / PAGE_SIZE));
+  const current = Math.min(Math.max(page, 0), pageCount - 1);
+  const start = current * PAGE_SIZE;
+  const rows = choices
+    .slice(start, start + PAGE_SIZE)
+    .map((choice) => [button(epoch, truncate(choice.name), { kind: "create", alias, digest: choice.digest })]);
+  const navigation: InlineKeyboardButton[] = [];
+  if (current > 0) navigation.push(button(epoch, "上一页", { kind: "root", alias, page: current - 1 }));
+  if (current < pageCount - 1) {
+    navigation.push(button(epoch, "下一页", { kind: "root", alias, page: current + 1 }));
+  }
+  return {
+    text:
+      choices.length === 0
+        ? `${alias} 下没有可用的子目录。`
+        : `在 ${alias} 下选择目录，新建 session（第 ${current + 1}/${pageCount} 页）：`,
+    keyboard: [
+      ...rows,
+      ...(navigation.length === 0 ? [] : [navigation]),
+      [backButton(epoch), closeButton(epoch)],
+    ],
   };
 }
 

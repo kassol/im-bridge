@@ -10,9 +10,9 @@
  *
  *   - Nothing is trusted across a click. A menu says what was true when it was
  *     drawn; a tap re-reads the allowlist, the topic, the epoch, the link, the
- *     backend's sessions, and the configured aliases before it acts, and then
- *     edits that same menu into whatever it found. A repeated tap therefore
- *     converges instead of duplicating.
+ *     backend's sessions, the configured cwd roots, and the directories under
+ *     them before it acts, and then edits that same menu into whatever it
+ *     found. A repeated tap therefore converges instead of duplicating.
  *   - The bridge never rebinds and never deletes on the user's behalf.
  *     `Store.link` refuses an occupied side, an active session refuses an
  *     unlink, and unlinking leaves the backend session alone.
@@ -51,6 +51,7 @@ import {
 } from "../telegram/updates.ts";
 import { AlbumCollector, type AlbumGroup } from "./albums.ts";
 import { createEpoch, decodeCallback, sessionSuffix, type CallbackAction } from "./callbacks.ts";
+import { directoryLabel, listSubdirectories, resolveInsideRoot } from "./directories.ts";
 import { MediaError, downloadImages, mediaNotice, planPrompt, type PromptPlan } from "./media.ts";
 import {
   markQueued,
@@ -75,6 +76,7 @@ import {
   linkedMenu,
   newSessionMenu,
   sessionLabel,
+  subdirectoryMenu,
   unknownCommandMenu,
   unlinkedMenu,
   APPROVAL_ALLOWED_TEXT,
@@ -111,6 +113,9 @@ export const SESSION_CONFLICT_NOTICE = "该 session 已绑定到其他 topic，�
 export const SESSION_GONE_NOTICE = "该 session 已不存在。";
 export const AMBIGUOUS_SESSION_NOTICE = "有多个 session 的编号结尾相同，无法确定绑定哪一个。";
 export const ALIAS_GONE_NOTICE = "该工作目录已不在配置中。";
+export const DIRECTORY_GONE_NOTICE = "该目录已不存在。";
+export const AMBIGUOUS_DIRECTORY_NOTICE = "有多个目录的编号相同，无法确定新建在哪一个。";
+export const DIRECTORY_OUTSIDE_NOTICE = "该目录已不在配置的工作目录内。";
 export const RUNNING_NOTICE = "session 正在运行，无法解除绑定。";
 export const UNLINKED_NOTICE = "已解除绑定，backend session 未删除。";
 export const RESEND_NOTICE = "上次输入可能未送达，请重新发送。";
@@ -129,8 +134,12 @@ export interface BridgeRuntimeOptions {
   store: Store;
   /** Rechecked on every update, including every callback. */
   allowlist: Allowlist;
-  /** Alias -> resolved directory. Only the alias ever reaches Telegram. */
-  cwdAliases: ReadonlyMap<string, string>;
+  /**
+   * Alias -> resolved parent directory. A session is created in one of the
+   * subdirectories of a root; only the alias and a directory name ever reach
+   * Telegram.
+   */
+  cwdRoots: ReadonlyMap<string, string>;
   logger: Logger;
   /** Injected by tests so callback data is predictable. */
   epoch?: string;
@@ -189,7 +198,7 @@ export class BridgeRuntime {
   readonly #backend: Backend;
   readonly #store: Store;
   readonly #allowlist: Allowlist;
-  readonly #cwdAliases: ReadonlyMap<string, string>;
+  readonly #cwdRoots: ReadonlyMap<string, string>;
   readonly #logger: Logger;
   readonly #polling: AbortController | undefined;
   /**
@@ -234,7 +243,7 @@ export class BridgeRuntime {
     this.#backend = options.backend;
     this.#store = options.store;
     this.#allowlist = options.allowlist;
-    this.#cwdAliases = options.cwdAliases;
+    this.#cwdRoots = options.cwdRoots;
     this.#logger = options.logger;
     this.#polling = options.polling;
     this.epoch = options.epoch ?? createEpoch();
@@ -855,7 +864,10 @@ export class BridgeRuntime {
     }
     if (action.kind === "new") return this.#openNewSession(update, progress);
     if (action.kind === "existing") return this.#openExistingSessions(update, action.page, progress);
-    if (action.kind === "create") return this.#createSession(update, action.alias, progress);
+    if (action.kind === "root") return this.#openRoot(update, action.alias, action.page, progress);
+    if (action.kind === "create") {
+      return this.#createSession(update, action.alias, action.digest, progress);
+    }
     if (action.kind === "bind") return this.#bindSession(update, action.sessionSuffix, progress);
     if (action.kind === "allow" || action.kind === "reject") {
       return this.#answerApproval(update, action.token, action.kind === "allow", progress);
@@ -935,7 +947,35 @@ export class BridgeRuntime {
       await this.#edit(update, await this.#menuFor(update.thread), progress);
       return { text: ALREADY_LINKED_NOTICE };
     }
-    await this.#edit(update, newSessionMenu(this.epoch, [...this.#cwdAliases.keys()]), progress);
+    const aliases = [...this.#cwdRoots.keys()];
+    // One configured root is not a choice: the directories under it are.
+    const only = aliases.length === 1 ? aliases[0] : undefined;
+    if (only !== undefined) return this.#openRoot(update, only, 0, progress);
+    await this.#edit(update, newSessionMenu(this.epoch, aliases), progress);
+    return undefined;
+  }
+
+  /**
+   * One page of the subdirectories of a root, read now rather than remembered.
+   * A project added or removed on disk shows up on the next tap.
+   */
+  async #openRoot(
+    update: InboundCallback,
+    alias: string,
+    page: number,
+    progress: UpdateProgress,
+  ): Promise<Notice | undefined> {
+    if (this.#linkOf(update.thread) !== undefined) {
+      await this.#edit(update, await this.#menuFor(update.thread), progress);
+      return { text: ALREADY_LINKED_NOTICE };
+    }
+    const root = this.#cwdRoots.get(alias);
+    if (root === undefined) {
+      await this.#edit(update, newSessionMenu(this.epoch, [...this.#cwdRoots.keys()]), progress);
+      return { text: ALIAS_GONE_NOTICE, alert: true };
+    }
+    const choices = await listSubdirectories(root);
+    await this.#edit(update, subdirectoryMenu(this.epoch, alias, choices, page), progress);
     return undefined;
   }
 
@@ -953,14 +993,20 @@ export class BridgeRuntime {
     return undefined;
   }
 
+  /**
+   * The tapped directory becomes a cwd only if it is still one: the listing is
+   * read again, the digest must match exactly one name, and that name has to
+   * resolve inside its root. Nothing the button asserted is taken on trust.
+   */
   async #createSession(
     update: InboundCallback,
     alias: string,
+    digest: string,
     progress: UpdateProgress,
   ): Promise<Notice | undefined> {
-    const directory = this.#cwdAliases.get(alias);
-    if (directory === undefined) {
-      await this.#edit(update, newSessionMenu(this.epoch, [...this.#cwdAliases.keys()]), progress);
+    const root = this.#cwdRoots.get(alias);
+    if (root === undefined) {
+      await this.#edit(update, newSessionMenu(this.epoch, [...this.#cwdRoots.keys()]), progress);
       return { text: ALIAS_GONE_NOTICE, alert: true };
     }
     if (this.#linkOf(update.thread) !== undefined) {
@@ -972,7 +1018,22 @@ export class BridgeRuntime {
     // backend again would leave an orphan session behind.
     let sessionId = progress.sessionId;
     if (sessionId === undefined) {
-      sessionId = await this.#backend.createSession(directory);
+      const choices = await listSubdirectories(root);
+      const matches = choices.filter((choice) => choice.digest === digest);
+      const chosen = matches.length === 1 ? matches[0] : undefined;
+      if (chosen === undefined) {
+        await this.#edit(update, subdirectoryMenu(this.epoch, alias, choices, 0), progress);
+        return {
+          text: matches.length === 0 ? DIRECTORY_GONE_NOTICE : AMBIGUOUS_DIRECTORY_NOTICE,
+          alert: true,
+        };
+      }
+      const cwd = await resolveInsideRoot(root, chosen.name);
+      if (cwd === undefined) {
+        await this.#edit(update, subdirectoryMenu(this.epoch, alias, choices, 0), progress);
+        return { text: DIRECTORY_OUTSIDE_NOTICE, alert: true };
+      }
+      sessionId = await this.#backend.createSession(cwd);
       progress.advance({ step: STEP_SESSION_CREATED, sessionId });
     }
     const notice = this.#link(update.thread, sessionId);
@@ -1065,14 +1126,18 @@ export class BridgeRuntime {
   }
 
   #label(session: Session): string {
-    return sessionLabel(session, this.#aliasOf(session.cwd));
+    return sessionLabel(session, this.#cwdName(session.cwd));
   }
 
-  /** Maps a real directory back to its configured name. Paths stay local. */
-  #aliasOf(cwd: string | undefined): string | undefined {
+  /**
+   * Maps a real cwd back to the root alias and directory name it sits under.
+   * A cwd no configured root covers gets no name at all; paths stay local.
+   */
+  #cwdName(cwd: string | undefined): string | undefined {
     if (cwd === undefined) return undefined;
-    for (const [alias, directory] of this.#cwdAliases) {
-      if (directory === cwd) return alias;
+    for (const [alias, root] of this.#cwdRoots) {
+      const name = directoryLabel(alias, root, cwd);
+      if (name !== undefined) return name;
     }
     return undefined;
   }

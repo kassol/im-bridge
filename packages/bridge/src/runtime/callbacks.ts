@@ -7,13 +7,13 @@
  *   - Every payload carries the process epoch. A button drawn before a restart
  *     decodes into a foreign epoch and is answered as expired instead of being
  *     applied to whatever the menu shows now.
- *   - The payload names a stable key — a cwd alias, the tail of a session id, or
- *     the short token of an approval — never a position in the list the menu
- *     happened to render. The list is rebuilt on every click, so an index would
- *     silently point at another session once a session appeared or was bound
- *     elsewhere. An approval token is resolved against a map that lives only in
- *     the process that filed the request, which is exactly as long as its epoch
- *     is valid.
+ *   - The payload names a stable key — a cwd root alias, the digest of a
+ *     directory name, the tail of a session id, or the short token of an
+ *     approval — never a position in the list the menu happened to render. The
+ *     list is rebuilt on every click, so an index would silently point at
+ *     another session or another directory once one appeared or disappeared. An
+ *     approval token is resolved against a map that lives only in the process
+ *     that filed the request, which is exactly as long as its epoch is valid.
  *
  * Telegram allows 64 bytes of callback data. `encodeCallback` proves the budget
  * rather than trusting it.
@@ -28,10 +28,15 @@ export const SESSION_SUFFIX_LENGTH = 8;
 export type CallbackAction =
   /** Redraw the menu for whatever state the topic is in now. */
   | { readonly kind: "manage" }
-  /** Open the list of configured cwd aliases. */
+  /** Open the list of configured cwd roots. */
   | { readonly kind: "new" }
-  /** Create a session in the directory of `alias`, then link it. */
-  | { readonly kind: "create"; readonly alias: string }
+  /** Open one page of the subdirectories of the cwd root `alias`. */
+  | { readonly kind: "root"; readonly alias: string; readonly page: number }
+  /**
+   * Create a session in the subdirectory of `alias` whose name has this
+   * digest, then link it. The name itself never fits the byte budget.
+   */
+  | { readonly kind: "create"; readonly alias: string; readonly digest: string }
   /** Open one page of bindable sessions. */
   | { readonly kind: "existing"; readonly page: number }
   /** Bind the session whose id ends with `sessionSuffix`. */
@@ -51,6 +56,7 @@ export interface Callback {
 const KIND_CODES = {
   manage: "m",
   new: "n",
+  root: "d",
   create: "c",
   existing: "e",
   bind: "b",
@@ -97,7 +103,8 @@ export function decodeCallback(data: string): Callback | undefined {
 }
 
 function argumentOf(action: CallbackAction): string {
-  if (action.kind === "create") return action.alias;
+  if (action.kind === "root") return `${action.alias}:${String(action.page)}`;
+  if (action.kind === "create") return `${action.alias}:${action.digest}`;
   if (action.kind === "existing") return String(action.page);
   if (action.kind === "bind") return action.sessionSuffix;
   if (action.kind === "allow" || action.kind === "reject") return action.token;
@@ -109,7 +116,17 @@ function readAction(code: string, argument: string): CallbackAction | undefined 
   if (code === KIND_CODES.new) return { kind: "new" };
   if (code === KIND_CODES.unlink) return { kind: "unlink" };
   if (code === KIND_CODES.close) return { kind: "close" };
-  if (code === KIND_CODES.create) return argument === "" ? undefined : { kind: "create", alias: argument };
+  if (code === KIND_CODES.root) {
+    const parts = splitAlias(argument);
+    if (parts === undefined) return undefined;
+    const page = Number(parts.rest);
+    if (!Number.isSafeInteger(page) || page < 0) return undefined;
+    return { kind: "root", alias: parts.alias, page };
+  }
+  if (code === KIND_CODES.create) {
+    const parts = splitAlias(argument);
+    return parts === undefined ? undefined : { kind: "create", alias: parts.alias, digest: parts.rest };
+  }
   if (code === KIND_CODES.allow) return argument === "" ? undefined : { kind: "allow", token: argument };
   if (code === KIND_CODES.reject) return argument === "" ? undefined : { kind: "reject", token: argument };
   if (code === KIND_CODES.bind) {
@@ -121,4 +138,14 @@ function readAction(code: string, argument: string): CallbackAction | undefined 
     return { kind: "existing", page };
   }
   return undefined;
+}
+
+/**
+ * `<alias>:<rest>`. A configured alias is letters, digits, hyphens, and
+ * underscores, so the first colon is the separator and never part of the name.
+ */
+function splitAlias(argument: string): { readonly alias: string; readonly rest: string } | undefined {
+  const at = argument.indexOf(":");
+  if (at <= 0 || at === argument.length - 1) return undefined;
+  return { alias: argument.slice(0, at), rest: argument.slice(at + 1) };
 }

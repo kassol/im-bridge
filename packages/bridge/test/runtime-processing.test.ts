@@ -8,7 +8,7 @@
  * allowed to remember.
  */
 import { execFile } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Session } from "../src/backends/types.ts";
 import { createLogger, type Logger } from "../src/log.ts";
 import { encodeCallback } from "../src/runtime/callbacks.ts";
+import { directoryDigest } from "../src/runtime/directories.ts";
 import { MAX_ATTEMPTS, STEP_QUEUED } from "../src/runtime/processing.ts";
 import { BridgeRuntime, PLATFORM, RESEND_NOTICE } from "../src/runtime/runtime.ts";
 import { Store } from "../src/store/store.ts";
@@ -39,7 +40,7 @@ const OTHER_SESSION = "01j8z4qk9m7f3b2n6x5c4v-0002";
 const MENU_MESSAGE = 900;
 const EPOCH = "epoch1";
 const WORK_DIR = "/private/tmp/im-bridge-work";
-const ALIASES = new Map([["work", WORK_DIR]]);
+const ROOTS = new Map([["work", WORK_DIR]]);
 const SECRET = "把生产库删了";
 
 let dir: string;
@@ -82,7 +83,10 @@ function link(sessionId: string, threadId: number = THREAD): void {
   store.link({ platform: PLATFORM, chatId: CHAT, threadId, backend: "dsh", sessionId });
 }
 
-async function start(sessions: readonly Session[] = [session(SESSION)]): Promise<BridgeRuntime> {
+async function start(
+  sessions: readonly Session[] = [session(SESSION)],
+  roots: ReadonlyMap<string, string> = ROOTS,
+): Promise<BridgeRuntime> {
   backend = new FakeBackend(sessions);
   server = await startFakeTelegram((call) => reply(call));
   runtime = new BridgeRuntime({
@@ -90,7 +94,7 @@ async function start(sessions: readonly Session[] = [session(SESSION)]): Promise
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
-    cwdAliases: ALIASES,
+    cwdRoots: roots,
     logger: capturingLogger(),
     epoch: EPOCH,
   });
@@ -215,7 +219,10 @@ describe("marking and settling", () => {
 
 describe("retries", () => {
   it("resumes from the recorded step instead of creating a second session", async () => {
-    await start([]);
+    // A real root, because creating a session reads the directories under it.
+    const root = realpathSync(dir);
+    mkdirSync(join(root, "project"));
+    await start([], new Map([["work", root]]));
     // The menu edit that follows session creation fails once; the retry must
     // bind the session the first attempt already created.
     reply = (call) => (call.method === "editMessageText" && call.count === 1 ? rejected() : okReply(call));
@@ -227,11 +234,11 @@ describe("retries", () => {
       thread: { chatId: CHAT, threadId: THREAD },
       userId: AUTHORISED,
       callbackId: "cb-1",
-      data: encodeCallback(EPOCH, { kind: "create", alias: "work" }),
+      data: encodeCallback(EPOCH, { kind: "create", alias: "work", digest: directoryDigest("project") }),
       messageId: MENU_MESSAGE,
     });
 
-    expect(backend.created).toHaveLength(1);
+    expect(backend.created).toEqual([{ cwd: join(root, "project"), sessionId: backend.created[0]?.sessionId }]);
     expect(store.findByThread(PLATFORM, CHAT, THREAD)?.sessionId).toBe(backend.created[0]?.sessionId);
     expect(store.listDeadLetters()).toHaveLength(0);
   });
@@ -433,7 +440,7 @@ describe("dead-letters list", () => {
       JSON.stringify({
         botToken: TOKEN,
         allowedUserIds: [AUTHORISED],
-        cwdAliases: { work: dir },
+        cwdRoots: { work: dir },
         databasePath: join(dir, "bridge.db"),
         dshUrl: "http://127.0.0.1:3080",
       }),

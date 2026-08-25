@@ -29,7 +29,7 @@ function config(extra: Partial<BridgeConfig> = {}): BridgeConfig {
   return {
     botToken: TOKEN,
     allowedUserIds: [AUTHORISED],
-    cwdAliases: new Map<string, string>(),
+    cwdRoots: new Map<string, string>(),
     databasePath: join(dir, "bridge.db"),
     dshUrl: "http://127.0.0.1:3080",
     logLevel: "info",

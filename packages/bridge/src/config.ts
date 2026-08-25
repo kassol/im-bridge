@@ -4,11 +4,11 @@
  * The bot token is the only credential in front of an agent that can run shell
  * commands, so configuration is one file rather than a merge of file and
  * environment: an env override path would let a stray exported variable widen
- * the allowlist or repoint a cwd alias without editing anything reviewable.
+ * the allowlist or repoint a cwd root without editing anything reviewable.
  * The LaunchAgent therefore passes a path and nothing else.
  *
  * Every check here fails startup. A bridge that starts with a broken allowlist
- * or an unreadable alias is worse than a bridge that does not start.
+ * or an unreadable cwd root is worse than a bridge that does not start.
  */
 import { open } from "node:fs/promises";
 import { isAbsolute } from "node:path";
@@ -18,8 +18,11 @@ import type { LogLevel } from "./log.ts";
 export interface BridgeConfig {
   readonly botToken: string;
   readonly allowedUserIds: readonly number[];
-  /** Alias -> resolved absolute directory. Real paths never reach Telegram. */
-  readonly cwdAliases: ReadonlyMap<string, string>;
+  /**
+   * Alias -> resolved absolute parent directory. A session is created in one of
+   * the subdirectories of a root; real paths never reach Telegram.
+   */
+  readonly cwdRoots: ReadonlyMap<string, string>;
   readonly databasePath: string;
   readonly dshUrl: string;
   readonly logLevel: LogLevel;
@@ -32,7 +35,7 @@ const REQUIRED_MODE = 0o600;
 const KNOWN_FIELDS = [
   "botToken",
   "allowedUserIds",
-  "cwdAliases",
+  "cwdRoots",
   "databasePath",
   "dshUrl",
   "logLevel",
@@ -56,7 +59,7 @@ export async function loadConfig(path: string): Promise<BridgeConfig> {
   return {
     botToken,
     allowedUserIds: parseAllowedUserIds(path, document),
-    cwdAliases: await parseCwdAliases(path, document),
+    cwdRoots: await parseCwdRoots(path, document),
     databasePath: requireNonBlank(path, document, "databasePath"),
     dshUrl: parseDshUrl(path, document),
     logLevel: parseLogLevel(path, document),
@@ -104,25 +107,27 @@ function parseAllowedUserIds(path: string, document: Record<string, unknown>): n
   });
 }
 
-async function parseCwdAliases(
+async function parseCwdRoots(
   path: string,
   document: Record<string, unknown>,
 ): Promise<ReadonlyMap<string, string>> {
-  const value = document["cwdAliases"];
-  if (!isRecord(value)) throw configError(path, "cwdAliases must be an object mapping alias to directory");
+  const value = document["cwdRoots"];
+  if (!isRecord(value)) {
+    throw configError(path, "cwdRoots must be an object mapping alias to parent directory");
+  }
   const resolved = new Map<string, string>();
   const seen = new Map<string, string>();
   for (const [alias, directory] of Object.entries(value)) {
     if (!ALIAS_PATTERN.test(alias)) {
-      throw configError(path, `cwd alias must be 1-32 letters, digits, hyphens, or underscores: ${alias}`);
+      throw configError(path, `cwd root alias must be 1-32 letters, digits, hyphens, or underscores: ${alias}`);
     }
     const previous = seen.get(alias.toLowerCase());
     if (previous !== undefined) {
-      throw configError(path, `duplicate cwd alias ignoring case: ${previous} and ${alias}`);
+      throw configError(path, `duplicate cwd root alias ignoring case: ${previous} and ${alias}`);
     }
     seen.set(alias.toLowerCase(), alias);
     if (typeof directory !== "string" || !isAbsolute(directory)) {
-      throw configError(path, `cwd alias ${alias} must point at an absolute directory path`);
+      throw configError(path, `cwd root ${alias} must point at an absolute directory path`);
     }
     resolved.set(alias, await resolveDirectory(path, alias, directory));
   }
@@ -135,7 +140,7 @@ async function resolveDirectory(path: string, alias: string, directory: string):
     real = await realpath(directory);
     if (!(await stat(real)).isDirectory()) throw new Error("not a directory");
   } catch (error) {
-    throw configError(path, `cwd alias ${alias} does not resolve to a directory`, error);
+    throw configError(path, `cwd root ${alias} does not resolve to a directory`, error);
   }
   return real;
 }

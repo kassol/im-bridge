@@ -5,13 +5,14 @@
  * against the fake Bot API plus real rows in a temporary SQLite store. Only the
  * backend is a stand-in, and it is used through the Backend contract alone.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Session } from "../src/backends/types.ts";
 import { createLogger, type Logger } from "../src/log.ts";
 import { encodeCallback, sessionSuffix } from "../src/runtime/callbacks.ts";
+import { directoryDigest } from "../src/runtime/directories.ts";
 import {
   MENU_EXPIRED_TEXT,
   MESSAGE_DISCARDED_TEXT,
@@ -22,6 +23,7 @@ import {
   ALIAS_GONE_NOTICE,
   AMBIGUOUS_SESSION_NOTICE,
   BridgeRuntime,
+  DIRECTORY_GONE_NOTICE,
   PLATFORM,
   RUNNING_NOTICE,
   SESSION_CONFLICT_NOTICE,
@@ -45,7 +47,7 @@ const MENU_MESSAGE = 900;
 const EPOCH = "epoch1";
 const WORK_DIR = "/private/tmp/im-bridge-work";
 const NOTES_DIR = "/private/tmp/im-bridge-notes";
-const ALIASES = new Map([
+const ROOTS = new Map([
   ["work", WORK_DIR],
   ["notes", NOTES_DIR],
 ]);
@@ -66,7 +68,10 @@ function silentLogger(): Logger {
   return createLogger({ level: "debug", write: () => {} });
 }
 
-async function start(sessions: readonly Session[] = []): Promise<void> {
+async function start(
+  sessions: readonly Session[] = [],
+  roots: ReadonlyMap<string, string> = ROOTS,
+): Promise<void> {
   backend = new FakeBackend(sessions);
   server = await startFakeTelegram((call) => {
     if (call.method === "answerCallbackQuery") return { json: { ok: true, result: true } };
@@ -77,7 +82,7 @@ async function start(sessions: readonly Session[] = []): Promise<void> {
     backend,
     store,
     allowlist: new Allowlist([AUTHORISED]),
-    cwdAliases: ALIASES,
+    cwdRoots: roots,
     logger: silentLogger(),
     epoch: EPOCH,
   });
@@ -342,36 +347,156 @@ describe("binding an existing session", () => {
 });
 
 describe("creating a session", () => {
-  it("offers only the configured aliases and creates before linking", async () => {
-    await start();
+  /** Real directories: the menu reads the disk when it is drawn and again on a tap. */
+  let workRoot: string;
+  let outside: string;
+  let roots: Map<string, string>;
+
+  function createDirectories(...names: readonly string[]): void {
+    for (const name of names) mkdirSync(join(workRoot, name));
+  }
+
+  beforeEach(() => {
+    workRoot = join(dir, "work");
+    mkdirSync(workRoot);
+    workRoot = realpathSync(workRoot);
+    outside = realpathSync(mkdtempSync(join(tmpdir(), "im-bridge-outside-")));
+    roots = new Map([["work", workRoot]]);
+  });
+
+  afterEach(() => {
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it("skips the root picker when only one root is configured", async () => {
+    createDirectories("alpha", "beta");
+    await start([], roots);
     await runtime.handleUpdate(message({ text: "/manage" }));
+
+    await tap("新建 session");
+
+    expect(textOf(lastCall("editMessageText"))).toContain("在 work 下选择目录");
+    expect(labels()).toEqual(["alpha", "beta", "返回", "关闭"]);
+  });
+
+  it("picks a root first when more than one is configured", async () => {
+    createDirectories("alpha");
+    const notesRoot = join(dir, "notes");
+    mkdirSync(join(notesRoot, "diary"), { recursive: true });
+    await start([], new Map([["work", workRoot], ["notes", realpathSync(notesRoot)]]));
+    await runtime.handleUpdate(message({ text: "/manage" }));
+
     await tap("新建 session");
     expect(labels()).toEqual(["work", "notes", "返回", "关闭"]);
 
-    await tap("work");
-    expect(backend.created).toEqual([{ cwd: WORK_DIR, sessionId: backend.created[0]?.sessionId }]);
+    await tap("notes");
+    expect(labels()).toEqual(["diary", "返回", "关闭"]);
+  });
+
+  it("lists only non-hidden immediate subdirectories, and no real path", async () => {
+    createDirectories("alpha", ".hidden", "beta");
+    mkdirSync(join(workRoot, "alpha", "nested"));
+    writeFileSync(join(workRoot, "notes.txt"), "x", "utf8");
+    // A link out of the root is not a directory entry, so it is never offered.
+    symlinkSync(outside, join(workRoot, "escape"));
+    await start([], roots);
+    await runtime.handleUpdate(message({ text: "/manage" }));
+
+    await tap("新建 session");
+
+    expect(labels()).toEqual(["alpha", "beta", "返回", "关闭"]);
+    expect(JSON.stringify(shownMenu().body)).not.toContain(workRoot);
+  });
+
+  it("pages subdirectories eight at a time", async () => {
+    createDirectories(...Array.from({ length: 20 }, (_unused, index) => `dir-${String(index).padStart(2, "0")}`));
+    await start([], roots);
+    await runtime.handleUpdate(message({ text: "/manage" }));
+
+    await tap("新建 session");
+    expect(textOf(lastCall("editMessageText"))).toContain("第 1/3 页");
+    expect(labels().filter((label) => label.startsWith("dir-"))).toHaveLength(8);
+
+    await tap("下一页");
+    expect(textOf(lastCall("editMessageText"))).toContain("第 2/3 页");
+    expect(labels()).toContain("dir-08");
+  });
+
+  it("creates the session in the chosen subdirectory and links it", async () => {
+    createDirectories("alpha", "beta");
+    await start([], roots);
+    await runtime.handleUpdate(message({ text: "/manage" }));
+    await tap("新建 session");
+
+    await tap("beta");
+
+    expect(backend.created).toEqual([
+      { cwd: join(workRoot, "beta"), sessionId: backend.created[0]?.sessionId },
+    ]);
     expect(linkedSessionId()).toBe(backend.created[0]?.sessionId);
     const edit = lastCall("editMessageText");
     expect(edit.body["message_id"]).toBe(MENU_MESSAGE);
     expect(textOf(edit)).toContain("已绑定 session");
+    // The label names the root and the directory, never the path.
+    expect(textOf(edit)).toContain("work/beta");
+    expect(textOf(edit)).not.toContain(workRoot);
   });
 
   it("does not create a second session when the button is tapped twice", async () => {
-    await start();
+    createDirectories("alpha");
+    await start([], roots);
     await runtime.handleUpdate(message({ text: "/manage" }));
     await tap("新建 session");
-    const data = buttonData("work");
+    const data = buttonData("alpha");
     await runtime.handleUpdate(callback(data));
     await runtime.handleUpdate(callback(data));
     expect(backend.created).toHaveLength(1);
     expect(store.list()).toHaveLength(1);
   });
 
-  it("rejects an alias the configuration no longer names", async () => {
-    await start();
-    await runtime.handleUpdate(callback(encodeCallback(EPOCH, { kind: "create", alias: "removed" })));
+  it("reports a directory that disappeared between drawing and tapping", async () => {
+    createDirectories("alpha", "beta");
+    await start([], roots);
+    await runtime.handleUpdate(message({ text: "/manage" }));
+    await tap("新建 session");
+    const data = buttonData("alpha");
+    rmSync(join(workRoot, "alpha"), { recursive: true });
+
+    await runtime.handleUpdate(callback(data));
+
+    expect(lastCall("answerCallbackQuery").body["text"]).toBe(DIRECTORY_GONE_NOTICE);
+    expect(backend.created).toHaveLength(0);
+    expect(linkedSessionId()).toBeUndefined();
+    // The menu is redrawn from the directories that are still there.
+    expect(labels()).toEqual(["beta", "返回", "关闭"]);
+  });
+
+  it("refuses callback data that names a directory outside the root", async () => {
+    createDirectories("alpha");
+    await start([], roots);
+    // Nothing in the listing has this digest, so no path is built from it.
+    const forged = encodeCallback(EPOCH, {
+      kind: "create",
+      alias: "work",
+      digest: directoryDigest(`../${basename(outside)}`),
+    });
+
+    await runtime.handleUpdate(callback(forged));
+
+    expect(lastCall("answerCallbackQuery").body["text"]).toBe(DIRECTORY_GONE_NOTICE);
+    expect(backend.created).toHaveLength(0);
+    expect(linkedSessionId()).toBeUndefined();
+  });
+
+  it("rejects a root alias the configuration no longer names", async () => {
+    await start([], roots);
+    const data = encodeCallback(EPOCH, { kind: "create", alias: "removed", digest: directoryDigest("alpha") });
+    await runtime.handleUpdate(callback(data));
     expect(lastCall("answerCallbackQuery").body["text"]).toBe(ALIAS_GONE_NOTICE);
     expect(backend.created).toHaveLength(0);
+
+    await runtime.handleUpdate(callback(encodeCallback(EPOCH, { kind: "root", alias: "removed", page: 0 })));
+    expect(lastCall("answerCallbackQuery").body["text"]).toBe(ALIAS_GONE_NOTICE);
   });
 });
 
@@ -506,7 +631,7 @@ describe("polling loop", () => {
       backend,
       store,
       allowlist: new Allowlist([AUTHORISED]),
-      cwdAliases: ALIASES,
+      cwdRoots: ROOTS,
       logger: silentLogger(),
       epoch: EPOCH,
     });

@@ -218,7 +218,8 @@ This repository uses a single-context domain documentation layout. See `docs/age
 - **用户白名单是唯一的鉴权**。硬校验 `from.id`，非白名单直接丢弃且不回复。
   这一条写错等于把机器的 shell 交出去（agent 能跑 bash），改动必须带测试。
 - bot token 与 API key 只从环境变量或 600 权限文件读，**不进代码、不进日志、不进 git**。
-- 新建 session 的 cwd 必须过允许列表校验。
+- 新建 session 的 cwd 必须是配置里某个 cwd root 的子目录：点击时按最新的 `readdir` 重新解析，
+  再用 `realpath` 证明结果仍在该 root 内，同时 dsh backend 的允许 cwd root 就是配置里的这些 root。
   参考反面教材：pi-remote 的 AGENTS.md 声称有允许列表，实际 `validateCwd` 只查了路径穿越，
   文档与实现不符。**本项目若写了就必须真的实现，并有测试证明。**
 
@@ -271,6 +272,17 @@ DSH_AGENTS_HOME=~/.dsh/empty-agents dsh web --no-open --port 3080
 
 ## 变更日志
 
+- 2026-08-25：`cwdAliases` 改名为 `cwdRoots`，alias 指向父目录而非单个工作目录。
+  新建 session 先选 root（只配了一个 root 时跳过这一步），再从该 root 的直接子目录里选：
+  `src/runtime/directories.ts` 在画菜单和点击时各读一次 `readdir`，只留 `isDirectory()`、
+  跳过点号开头的目录、按名字排序、每页 8 条。callback data 带
+  `<root alias>:<目录名 sha256 前 8 位>`，不含目录名也不含列表下标；点击时按摘要在最新
+  列表里重新解析，目录消失或摘要撞名都报错不猜，选中的名字还要经 `realpath` 证明仍在 root
+  内才允许当 cwd。session 没有 title 时标签是 `<root alias>/<目录名>` + session id 末 8 位，
+  root 之外的 cwd 不带任何路径。`src/config.ts`（校验规则不变）、`src/index.ts`、
+  `scripts/setup-bridge.sh`（提示语改为 cwd roots as name=/absolute/parent-directory）、
+  `packages/bridge/live/e2e.ts` 同步改名，不留兼容层。ADR 0003 加 2026-08-25 修订：
+  root 下的目录名会展示给白名单用户，真实完整路径仍然不出现。新增 13 项单测（共 310）。
 - 2026-08-25：代码评审修复。Backend 契约新增 `ApprovalNotPendingError`，dsh adapter 抛它、
   runtime 按 `instanceof` 判断，不再匹配错误文案；`failureSummary` 移到 `src/telegram/api.ts`，
   `bridge.event.failed` 与 `telegram.update.failed` 只记错误类型，异常消息不再进日志；

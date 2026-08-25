@@ -61,11 +61,11 @@ async function runService(config: BridgeConfig): Promise<void> {
   // any update is accepted.
   const identity = await api.getMe();
   const store = new Store(config.databasePath);
-  // A session may only be created inside a configured alias directory, so the
-  // alias map is also the backend's allowed cwd roots.
+  // A session may only be created inside a configured cwd root, so the root
+  // map is also the backend's allowed cwd roots.
   const backend = new DshBackend({
     baseUrl: config.dshUrl,
-    allowedCwdRoots: [...config.cwdAliases.values()],
+    allowedCwdRoots: [...config.cwdRoots.values()],
   });
   logger.info("bridge.started", { botId: identity.id, count: allowlist.size });
 
@@ -75,7 +75,7 @@ async function runService(config: BridgeConfig): Promise<void> {
     backend,
     store,
     allowlist,
-    cwdAliases: config.cwdAliases,
+    cwdRoots: config.cwdRoots,
     logger,
     polling,
   });
@@ -135,7 +135,7 @@ async function runCommand(command: readonly string[], config: BridgeConfig): Pro
   }
   if (command[0] === "config" && command[1] === "check" && command.length === 2) {
     // Reaching here is the whole check: `loadConfig` already proved ownership,
-    // mode, every field, and every alias directory.
+    // mode, every field, and every cwd root directory.
     createLogger({ level: "info" }).info("bridge.config.ok", { count: config.allowedUserIds.length });
     return;
   }
